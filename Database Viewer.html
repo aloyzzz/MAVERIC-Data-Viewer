@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MAVERIC GSS — Database Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+<style>
+  html, body, #root { height: 100%; margin: 0; padding: 0; }
+  body {
+    background: #050505;
+    font-family: 'Inter', system-ui, sans-serif;
+    color: #E5E5E5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
+  }
+  /* Alias the variable-font names used throughout the source */
+  @font-face { font-family: 'Inter Variable'; src: local('Inter'); }
+  @font-face { font-family: 'JetBrains Mono Variable'; src: local('JetBrains Mono'); }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #222; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #333; }
+
+  *:focus { outline: none; }
+  *:focus-visible { outline: 1px solid rgba(48,200,224,0.5); outline-offset: 0; }
+
+  @keyframes detail-swap-anim {
+    0% { opacity: 0; transform: translateY(6px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes flash-new-bg {
+    0% { background-color: rgba(60,201,142,0.15); }
+    30% { background-color: rgba(60,201,142,0.05); }
+    100% { background-color: transparent; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script src="db-data.js"></script>
+<script type="text/babel" src="db-shared.jsx"></script>
+<script type="text/babel" src="db-chrome.jsx"></script>
+<script type="text/babel" src="db-variations.jsx"></script>
+<script type="text/babel" src="design-canvas.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+function Loader() {
+  const [ready, setReady] = useState(false);
+  useEffect(() => { window.DB_READY.then(() => setReady(true)); }, []);
+  if (!ready) return <div style={{padding:32, color:'#8A8A8A', fontFamily:'JetBrains Mono, monospace', fontSize:12}}>loading ground_station.db…</div>;
+  return <App />;
+}
+
+function App() {
+  return (
+    <DesignCanvas title="MAVERIC GSS — Database Viewer" subtitle="Two layout directions for the telemetry / mission archive browser. Both follow the existing console design language: pure-black surfaces, restrained semantic accents, JetBrains Mono for data, Inter for UI.">
+      <DCSection id="layouts" title="Layouts">
+        <DCArtboard id="varA" label="A · Sidebar + Grid + Right Drawer" width={1500} height={920}>
+          <window.VariationA />
+        </DCArtboard>
+        <DCArtboard id="varB" label="B · Open-Table Tabs + Grid + Bottom Detail" width={1500} height={920}>
+          <window.VariationB />
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Loader />);
+</script>
+
+<template id="__bundler_thumbnail">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <rect width="100" height="100" fill="#080808"/>
+    <g transform="translate(30 30)" fill="none" stroke="#30C8E0" stroke-width="2">
+      <ellipse cx="20" cy="6" rx="20" ry="6"/>
+      <path d="M0 6 v12 a20 6 0 0 0 40 0 v-12"/>
+      <path d="M0 18 v12 a20 6 0 0 0 40 0 v-12"/>
+      <path d="M0 30 v12 a20 6 0 0 0 40 0 v-12"/>
+    </g>
+  </svg>
+</template>
+</body>
+</html>
