@@ -10,14 +10,13 @@ import { DetailPane } from '../components/DetailPane';
 import { CommandPalette } from '../components/CommandPalette';
 import { CsvExportTab } from '../components/CsvExportTab';
 import { Dashboard } from '../components/Dashboard';
+import { IngestPage } from '../components/IngestPage';
 
 const NAV_TABS = [
   { id: '__dashboard__', label: 'Dashboard' },
   { id: '__db__', label: 'Database' },
-  { id: '__radio__', label: 'Radio' },
-  { id: 'gnc', label: 'GNC' },
-  { id: 'eps', label: 'EPS' },
   { id: '__export__', label: '↓ Export CSV' },
+  { id: '__ingest__', label: '↑ Ingest' },
 ];
 
 interface VariationAProps {
@@ -69,21 +68,25 @@ export function VariationA({ schema }: VariationAProps) {
       }}>
         {NAV_TABS.map((t) => {
           const active = t.id === navTab;
-          const isExport = t.id === '__export__';
+          const isExport  = t.id === '__export__';
+          const isIngest  = t.id === '__ingest__';
+          const isSpecial = isExport || isIngest;
           return (
             <div
               key={t.id}
               onClick={() => setNavTab(t.id)}
               style={{
                 padding: '4px 10px', fontSize: 11.5,
-                color: active ? (isExport ? C.active : C.textPrimary) : (isExport ? C.textMuted : C.textMuted),
+                color: active
+                  ? (isIngest ? C.info : isExport ? C.active : C.textPrimary)
+                  : C.textMuted,
                 backgroundColor: active ? C.bgPanelRaised : 'transparent',
                 border: active ? `1px solid ${C.borderSubtle}` : '1px solid transparent',
                 borderBottom: active ? `1px solid ${C.bgPanelRaised}` : '1px solid transparent',
                 borderRadius: '3px 3px 0 0',
                 cursor: 'pointer',
                 marginLeft: isExport ? 'auto' : undefined,
-                fontFamily: isExport ? C.fontMono : undefined,
+                fontFamily: isSpecial ? C.fontMono : undefined,
               }}
             >
               {t.label}
@@ -98,8 +101,11 @@ export function VariationA({ schema }: VariationAProps) {
       {/* Export tab */}
       {navTab === '__export__' && <CsvExportTab schema={schema} />}
 
+      {/* Ingest tab */}
+      {navTab === '__ingest__' && <IngestPage />}
+
       {/* 3-pane area */}
-      {navTab !== '__export__' && navTab !== '__dashboard__' && (
+      {navTab !== '__export__' && navTab !== '__dashboard__' && navTab !== '__ingest__' && (
         <div style={{ display: 'flex', flex: 1, minHeight: 0, padding: 12 }}>
           <div style={{
             display: 'flex', flex: 1, minHeight: 0,

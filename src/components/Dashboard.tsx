@@ -244,8 +244,11 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
 
   const loading = lPass || lRx || lTx || lParam || lAlarm || lVerif;
 
-  /* ── pass metadata ── */
-  const pass = passRows[0];
+  /* ── pass metadata — pick latest by pass_id ── */
+  const pass = passRows.length > 0
+    ? passRows.reduce((latest, r) =>
+        Number(r['pass_id']) > Number(latest['pass_id']) ? r : latest)
+    : undefined;
 
   const duration = useMemo(() => {
     if (!pass) return null;
@@ -397,8 +400,9 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
 
   /* ── render ──────────────────────────────────────────────────────────────*/
   return (
+    <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
     <div style={{
-      flex: 1, overflow: 'auto', padding: 12,
+      padding: 12,
       display: 'flex', flexDirection: 'column', gap: 10,
     }}>
 
@@ -428,7 +432,7 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
               </span>
             </div>
             <span style={{ fontSize: 20, fontFamily: C.fontMono, color: C.textPrimary, letterSpacing: '0.04em' }}>
-              {pass ? String(pass['session_id'] ?? `PASS-${pass['pass_id']}`) : '—'}
+              {pass ? String(pass['pass_id']) : '—'}
             </span>
           </div>
 
@@ -817,6 +821,7 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
           {pass ? `pass_id: ${pass['pass_id']}` : ''}
         </span>
       </div>
+    </div>
     </div>
   );
 }

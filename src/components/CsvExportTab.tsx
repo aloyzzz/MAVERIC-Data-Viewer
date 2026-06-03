@@ -115,6 +115,8 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
   const [tsTo, setTsTo]     = useState('');
   const [textFilter, setTextFilter]       = useState('');
   const [paramFilter, setParamFilter]     = useState('');
+  const [passIdFrom, setPassIdFrom]       = useState('');
+  const [passIdTo, setPassIdTo]           = useState('');
 
   /* fetch rows for selected table */
   const { rows: allRows, loading } = useTableRows(selectedTableId);
@@ -131,8 +133,21 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
     return colSelection.get(selectedTableId)!;
   }, [selectedTableId, columns, colSelection]);
 
-  const hasTsMs     = columns.some((c) => c.id === 'ts_ms');
+  const hasTsMs      = columns.some((c) => c.id === 'ts_ms');
+  const hasPassId    = columns.some((c) => c.id === 'pass_id');
   const isParamTable = selectedTableId === 'event_parameter';
+
+  /* pass id range available in this table */
+  const passIdRange = useMemo(() => {
+    if (!hasPassId || loading || allRows.length === 0) return null;
+    let lo = Infinity, hi = -Infinity;
+    allRows.forEach((r) => {
+      const v = Number(r['pass_id']);
+      if (!isNaN(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    });
+    if (!isFinite(lo)) return null;
+    return { lo, hi };
+  }, [allRows, hasPassId, loading]);
 
   /* unique parameter names */
   const paramNames = useMemo(() => {
@@ -154,6 +169,14 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
       const to = new Date(tsTo).getTime();
       rows = rows.filter((r) => Number(r['ts_ms']) <= to);
     }
+    if (hasPassId && passIdFrom.trim()) {
+      const lo = Number(passIdFrom.trim());
+      if (!isNaN(lo)) rows = rows.filter((r) => Number(r['pass_id']) >= lo);
+    }
+    if (hasPassId && passIdTo.trim()) {
+      const hi = Number(passIdTo.trim());
+      if (!isNaN(hi)) rows = rows.filter((r) => Number(r['pass_id']) <= hi);
+    }
     if (isParamTable && paramFilter.trim()) {
       const lc = paramFilter.toLowerCase();
       rows = rows.filter((r) => String(r['name'] ?? '').toLowerCase().includes(lc));
@@ -162,7 +185,7 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
       rows = applyFilter(rows, textFilter);
     }
     return rows;
-  }, [allRows, hasTsMs, tsFrom, tsTo, isParamTable, paramFilter, textFilter]);
+  }, [allRows, hasTsMs, tsFrom, tsTo, hasPassId, passIdFrom, passIdTo, isParamTable, paramFilter, textFilter]);
 
   const activeColumns = columns.filter((c) => colSet.has(c.id));
   const preview       = filtered.slice(0, 10);
@@ -178,6 +201,7 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
     setSelectedTableId(id);
     setTsFrom(''); setTsTo('');
     setTextFilter(''); setParamFilter('');
+    setPassIdFrom(''); setPassIdTo('');
   };
 
   const handleDownload = () => {
@@ -434,6 +458,52 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
                   </ConfigSection>
                 )}
 
+                {/* PASS ID RANGE FILTER */}
+                {hasPassId && (
+                  <ConfigSection label="pass id range">
+                    <FieldLabel>from pass id</FieldLabel>
+                    <input
+                      type="number"
+                      placeholder="min pass id"
+                      value={passIdFrom}
+                      onChange={(e) => setPassIdFrom(e.target.value)}
+                      style={inputStyle}
+                    />
+                    <div style={{ height: 6 }} />
+                    <FieldLabel>to pass id</FieldLabel>
+                    <input
+                      type="number"
+                      placeholder="max pass id"
+                      value={passIdTo}
+                      onChange={(e) => setPassIdTo(e.target.value)}
+                      style={inputStyle}
+                    />
+                    {passIdRange && (
+                      <div style={{
+                        marginTop: 6, padding: '4px 8px',
+                        backgroundColor: C.bgApp, border: `1px solid ${C.borderSubtle}`,
+                        borderRadius: 3, fontSize: 9.5, fontFamily: C.fontMono,
+                        color: C.textDisabled, lineHeight: 1.6,
+                      }}>
+                        available&nbsp;
+                        <span style={{ color: C.active }}>{passIdRange.lo}</span>
+                        {passIdRange.lo !== passIdRange.hi && (
+                          <> – <span style={{ color: C.active }}>{passIdRange.hi}</span></>
+                        )}
+                        {' '}({passIdRange.hi - passIdRange.lo + 1} pass{passIdRange.hi - passIdRange.lo + 1 !== 1 ? 'es' : ''})
+                      </div>
+                    )}
+                    {(passIdFrom || passIdTo) && (
+                      <button
+                        onClick={() => { setPassIdFrom(''); setPassIdTo(''); }}
+                        style={{ ...smallBtnStyle, marginTop: 6, width: '100%' }}
+                      >
+                        ✕ clear range
+                      </button>
+                    )}
+                  </ConfigSection>
+                )}
+
                 {/* ROW FILTER */}
                 <ConfigSection label="row filter">
                   <FieldLabel>query expression</FieldLabel>
@@ -537,7 +607,7 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
                   <StatPill label="total rows" value={(table?.rows ?? 0).toLocaleString()} />
                   <StatPill label="columns" value={`${colSet.size} / ${columns.length}`} />
                   <StatPill label="est. file size" value={estimateSize(filtered.length, colSet.size)} />
-                  {(tsFrom || tsTo || textFilter || paramFilter) && (
+                  {(tsFrom || tsTo || textFilter || paramFilter || passIdFrom || passIdTo) && (
                     <span style={{
                       fontSize: 9.5, fontFamily: C.fontMono, color: C.warning,
                       padding: '2px 7px', borderRadius: 3,
@@ -705,6 +775,14 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
                         backgroundColor: C.activeFill, color: C.active, border: `1px solid ${C.active}33`,
                       }}>
                         time-filtered
+                      </span>
+                    )}
+                    {(passIdFrom || passIdTo) && (
+                      <span style={{
+                        fontSize: 9.5, fontFamily: C.fontMono, padding: '2px 7px', borderRadius: 3,
+                        backgroundColor: C.infoFill, color: C.info, border: `1px solid ${C.info}33`,
+                      }}>
+                        pass {passIdFrom || '…'}–{passIdTo || '…'}
                       </span>
                     )}
                     {(textFilter || paramFilter) && (

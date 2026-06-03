@@ -1,13 +1,13 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { C } from '../lib/colors';
 
-interface MiniHeaderProps {
-  layout: 'A' | 'B';
-  onLayoutChange: (l: 'A' | 'B') => void;
-}
-
-export function MiniHeader({ layout, onLayoutChange }: MiniHeaderProps) {
-  const [now] = useState(() => new Date());
+export function MiniHeader() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const utcDate = now.toISOString().slice(0, 10);
   const utcTime = now.toISOString().slice(11, 19);
 
   return (
@@ -43,42 +43,15 @@ export function MiniHeader({ layout, onLayoutChange }: MiniHeaderProps) {
       <span style={{ color: C.borderStrong, fontSize: 11 }}>|</span>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 8, fontFamily: C.fontMono, fontSize: 11 }}>
-        <span style={{ color: C.textMuted }}>2026-05-07-000</span>
-        <span style={{ color: C.textDisabled }}>·</span>
         <span style={{ textTransform: 'uppercase', color: C.textMuted, fontSize: 10, letterSpacing: '0.04em' }}>OP</span>
         <span style={{ color: C.textSecondary }}>lcurry@SCFA-LAX</span>
       </div>
 
       {/* Right cluster */}
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, fontFamily: C.fontMono, fontSize: 11 }}>
-        <span style={{ color: C.success, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: C.success, boxShadow: `0 0 6px ${C.success}` }} />
-          5.4/s
-        </span>
-        <span style={{ color: C.borderStrong }}>|</span>
         <span style={{ color: C.textPrimary }}>
-          2026-05-07 {utcTime} <span style={{ color: C.textDisabled }}>UTC</span>
+          {utcDate} {utcTime} <span style={{ color: C.textDisabled }}>UTC</span>
         </span>
-        <span style={{ color: C.borderStrong }}>|</span>
-        {/* Layout toggle */}
-        <div style={{ display: 'flex', gap: 2 }}>
-          {(['A', 'B'] as const).map((l) => (
-            <button
-              key={l}
-              onClick={() => onLayoutChange(l)}
-              style={{
-                background: layout === l ? C.bgPanelRaised : 'transparent',
-                border: `1px solid ${layout === l ? C.borderStrong : C.borderSubtle}`,
-                color: layout === l ? C.active : C.textDisabled,
-                padding: '1px 7px',
-                borderRadius: 3,
-                fontSize: 10,
-                fontFamily: C.fontMono,
-                cursor: 'pointer',
-              }}
-            >{l}</button>
-          ))}
-        </div>
       </div>
     </div>
   );

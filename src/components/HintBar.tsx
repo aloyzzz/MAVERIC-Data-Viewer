@@ -4,7 +4,6 @@ const DEFAULT_HINTS = [
   { k: 'Ctrl+K', d: 'Search' },
   { k: '/', d: 'Filter' },
   { k: 'Esc', d: 'Deselect' },
-  { k: 'A / B', d: 'Layout' },
   { k: '↓ csv', d: 'Export' },
 ];
 

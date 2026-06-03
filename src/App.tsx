@@ -1,14 +1,11 @@
-import { useState } from 'react';
 import { C } from './lib/colors';
 import { useSchema } from './hooks/useApi';
 import { MiniHeader } from './components/MiniHeader';
 import { HintBar } from './components/HintBar';
 import { VariationA } from './layouts/VariationA';
-import { VariationB } from './layouts/VariationB';
 
 export function App() {
   const { schema, error } = useSchema();
-  const [layout, setLayout] = useState<'A' | 'B'>('A');
 
   if (error) {
     return (
@@ -50,8 +47,8 @@ export function App() {
       overflow: 'hidden',
       position: 'relative',
     }}>
-      <MiniHeader layout={layout} onLayoutChange={setLayout} />
-      {layout === 'A' ? <VariationA schema={schema} /> : <VariationB schema={schema} />}
+      <MiniHeader />
+      <VariationA schema={schema} />
       <HintBar />
     </div>
   );
