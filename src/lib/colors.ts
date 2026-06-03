@@ -36,6 +36,8 @@ const TONE_MAP: Record<string, Tone> = {
   CRITICAL: 'danger', CLEARED: 'success',
   START: 'success', STOP: 'neutral', RUNNING: 'success', STOPPED: 'neutral',
   TX: 'info', RX: 'success',
+  // alarm state values from the DB
+  UNACKED_ACTIVE: 'warning', UNACKED_CLEARED: 'neutral',
 };
 
 export function toneOf(label: string): Tone {

@@ -8,6 +8,8 @@ import { DataTable } from '../components/DataTable';
 import { DetailPane } from '../components/DetailPane';
 import { Sparkline } from '../components/Sparkline';
 import { CommandPalette } from '../components/CommandPalette';
+import { CsvExportTab } from '../components/CsvExportTab';
+import { Dashboard } from '../components/Dashboard';
 
 const LIVE_STATS: Record<string, { rate: string; tone: 'success' | 'warning' | 'neutral' }> = {
   event_rx_packet:    { rate: '0.5/s', tone: 'success' },
@@ -48,6 +50,7 @@ interface VariationBProps {
 }
 
 export function VariationB({ schema }: VariationBProps) {
+  const [navTab, setNavTab] = useState('__dashboard__');
   const [openTabs, setOpenTabs] = useState(['event_rx_packet', 'event_parameter', 'passes', 'event_alarm']);
   const [activeId, setActiveId] = useState('event_rx_packet');
   const [selected, setSelected] = useState<Row | null>(null);
@@ -107,25 +110,44 @@ export function VariationB({ schema }: VariationBProps) {
       }}>
         {[
           { id: '__dashboard__', label: 'Dashboard' },
-          { id: '__db__', label: 'Database', active: true },
+          { id: '__db__', label: 'Database' },
           { id: '__radio__', label: 'Radio' },
           { id: 'gnc', label: 'GNC' },
           { id: 'eps', label: 'EPS' },
-        ].map((t) => (
-          <div key={t.id} style={{
-            padding: '4px 10px', fontSize: 11.5,
-            color: (t as { active?: boolean }).active ? C.textPrimary : C.textMuted,
-            backgroundColor: (t as { active?: boolean }).active ? C.bgPanelRaised : 'transparent',
-            border: (t as { active?: boolean }).active ? `1px solid ${C.borderSubtle}` : '1px solid transparent',
-            borderBottom: (t as { active?: boolean }).active ? `1px solid ${C.bgPanelRaised}` : '1px solid transparent',
-            borderRadius: '3px 3px 0 0',
-            cursor: 'default',
-          }}>{t.label}</div>
-        ))}
+          { id: '__export__', label: '↓ Export CSV' },
+        ].map((t) => {
+          const active = t.id === navTab;
+          const isExport = t.id === '__export__';
+          return (
+            <div
+              key={t.id}
+              onClick={() => setNavTab(t.id)}
+              style={{
+                padding: '4px 10px', fontSize: 11.5,
+                color: active ? (isExport ? C.active : C.textPrimary) : C.textMuted,
+                backgroundColor: active ? C.bgPanelRaised : 'transparent',
+                border: active ? `1px solid ${C.borderSubtle}` : '1px solid transparent',
+                borderBottom: active ? `1px solid ${C.bgPanelRaised}` : '1px solid transparent',
+                borderRadius: '3px 3px 0 0',
+                cursor: 'pointer',
+                marginLeft: isExport ? 'auto' : undefined,
+                fontFamily: isExport ? C.fontMono : undefined,
+              }}
+            >
+              {t.label}
+            </div>
+          );
+        })}
       </div>
 
+      {/* Dashboard tab */}
+      {navTab === '__dashboard__' && <Dashboard schema={schema} onNavigate={(tab) => setNavTab(tab)} />}
+
+      {/* Export tab */}
+      {navTab === '__export__' && <CsvExportTab schema={schema} />}
+
       {/* Database body */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: 12 }}>
+      {navTab !== '__export__' && navTab !== '__dashboard__' && <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: 12 }}>
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0,
           border: `1px solid ${C.borderSubtle}`,
@@ -307,7 +329,7 @@ export function VariationB({ schema }: VariationBProps) {
             <span style={{ marginLeft: 'auto' }}>{sorted.length.toLocaleString()} rows · cached</span>
           </div>
         </div>
-      </div>
+      </div>}
 
       <CommandPalette
         open={paletteOpen}
