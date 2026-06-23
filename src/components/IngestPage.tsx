@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, CSSProperties } from 'react';
+import { useState, useRef, useCallback, useEffect, CSSProperties } from 'react';
 import { C } from '../lib/colors';
 
 /* ─── types ──────────────────────────────────────────────────────────────── */
@@ -11,7 +11,7 @@ interface IngestResult {
   warnings: string[];
 }
 
-type Phase = 'idle' | 'ready' | 'ingesting' | 'done' | 'error';
+type Phase = 'idle' | 'ready' | 'confirm' | 'ingesting' | 'done' | 'error';
 
 /* ─── shared styles ──────────────────────────────────────────────────────── */
 
@@ -60,7 +60,9 @@ export function IngestPage() {
   const [result, setResult]     = useState<IngestResult | null>(null);
   const [error, setError]       = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [passIdInput, setPassIdInput] = useState('');
+  const passIdRef = useRef<HTMLInputElement>(null);
+  const inputRef  = useRef<HTMLInputElement>(null);
 
   /* parse a quick preview of the file without sending it yet */
   const parsePreview = useCallback((f: File) => {
@@ -102,13 +104,27 @@ export function IngestPage() {
     if (f) acceptFile(f);
   };
 
-  const handleIngest = async () => {
+  /* focus the pass ID input when the modal opens */
+  useEffect(() => {
+    if (phase === 'confirm') {
+      setTimeout(() => passIdRef.current?.focus(), 50);
+    }
+  }, [phase]);
+
+  const handleIngestClick = () => {
+    setPassIdInput('');
+    setPhase('confirm');
+  };
+
+  const handleConfirm = async () => {
     if (!file) return;
     setPhase('ingesting');
     setError(null);
     try {
       const form = new FormData();
       form.append('file', file);
+      const trimmed = passIdInput.trim();
+      if (trimmed) form.append('passId', trimmed);
       const res = await fetch('/api/ingest', { method: 'POST', body: form });
       const data = await res.json() as IngestResult | { error: string };
       if ('error' in data) {
@@ -124,6 +140,8 @@ export function IngestPage() {
     }
   };
 
+  const handleCancelConfirm = () => setPhase('ready');
+
   const handleReset = () => {
     setPhase('idle');
     setFile(null);
@@ -133,10 +151,13 @@ export function IngestPage() {
     if (inputRef.current) inputRef.current.value = '';
   };
 
+  const passIdNum    = passIdInput.trim() ? parseInt(passIdInput.trim(), 10) : null;
+  const passIdValid  = passIdNum == null || (!isNaN(passIdNum) && passIdNum > 0);
   const totalPreview = preview ? Object.values(preview.kinds).reduce((a, b) => a + b, 0) : 0;
   const totalResult  = result  ? Object.values(result.counts).reduce((a, b) => a + b, 0) : 0;
 
   return (
+    <>
     <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
       <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 860 }}>
 
@@ -304,19 +325,19 @@ export function IngestPage() {
 
         {/* ── action bar ── */}
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-          {(phase === 'ready' || phase === 'ingesting') && (
+          {(phase === 'ready' || phase === 'confirm' || phase === 'ingesting') && (
             <button
-              onClick={handleIngest}
-              disabled={phase === 'ingesting'}
+              onClick={handleIngestClick}
+              disabled={phase === 'ingesting' || phase === 'confirm'}
               style={{
                 padding: '8px 28px', fontSize: 12.5, ...mono,
                 fontWeight: 700, borderRadius: 4, border: 'none',
-                backgroundColor: phase === 'ingesting' ? C.bgPanelRaised : C.active,
-                color: phase === 'ingesting' ? C.textDisabled : C.bgApp,
-                cursor: phase === 'ingesting' ? 'not-allowed' : 'pointer',
+                backgroundColor: phase === 'ingesting' || phase === 'confirm' ? C.bgPanelRaised : C.active,
+                color: phase === 'ingesting' || phase === 'confirm' ? C.textDisabled : C.bgApp,
+                cursor: phase === 'ingesting' || phase === 'confirm' ? 'not-allowed' : 'pointer',
                 transition: 'background 0.15s',
               }}
-              onMouseEnter={(e) => { if (phase !== 'ingesting') (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; }}
+              onMouseEnter={(e) => { if (phase === 'ready') (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.filter = ''; }}
             >
               {phase === 'ingesting' ? '⟳ ingesting…' : '↑ Ingest into Database'}
@@ -352,5 +373,94 @@ export function IngestPage() {
 
       </div>
     </div>
+
+    {/* ── pass ID modal ── */}
+    {phase === 'confirm' && (
+      <div
+        onClick={handleCancelConfirm}
+        style={{
+          position: 'fixed', inset: 0, zIndex: 100,
+          backgroundColor: 'rgba(0,0,0,0.6)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            backgroundColor: C.bgPanel,
+            border: `1px solid ${C.borderStrong}`,
+            borderRadius: 6, padding: 24, width: 360,
+            display: 'flex', flexDirection: 'column', gap: 16,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={{ fontSize: 13, ...mono, color: C.textPrimary, fontWeight: 600 }}>
+              Assign Pass ID
+            </span>
+            <span style={{ fontSize: 10.5, ...mono, color: C.textDisabled }}>
+              Leave blank to auto-assign the next available ID
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{ fontSize: 9.5, ...mono, textTransform: 'uppercase', letterSpacing: '0.1em', color: C.textDisabled }}>
+              Pass ID
+            </label>
+            <input
+              ref={passIdRef}
+              type="number"
+              min={1}
+              placeholder="auto"
+              value={passIdInput}
+              onChange={(e) => setPassIdInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && passIdValid) handleConfirm();
+                if (e.key === 'Escape') handleCancelConfirm();
+              }}
+              style={{
+                width: '100%', padding: '7px 10px', fontSize: 13,
+                ...mono, color: passIdValid ? C.textPrimary : C.danger,
+                backgroundColor: C.bgApp,
+                border: `1px solid ${passIdValid ? C.borderStrong : C.danger}`,
+                borderRadius: 3, outline: 'none', boxSizing: 'border-box',
+              }}
+            />
+            {!passIdValid && (
+              <span style={{ fontSize: 10, ...mono, color: C.danger }}>Must be a positive integer</span>
+            )}
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button
+              onClick={handleCancelConfirm}
+              style={{
+                padding: '6px 16px', fontSize: 11, ...mono,
+                backgroundColor: C.bgPanelRaised, color: C.textMuted,
+                border: `1px solid ${C.borderSubtle}`, borderRadius: 3, cursor: 'pointer',
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleConfirm}
+              disabled={!passIdValid}
+              style={{
+                padding: '6px 20px', fontSize: 11, ...mono, fontWeight: 700,
+                backgroundColor: passIdValid ? C.active : C.bgPanelRaised,
+                color: passIdValid ? C.bgApp : C.textDisabled,
+                border: 'none', borderRadius: 3,
+                cursor: passIdValid ? 'pointer' : 'not-allowed',
+              }}
+              onMouseEnter={(e) => { if (passIdValid) (e.currentTarget as HTMLElement).style.filter = 'brightness(1.15)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.filter = ''; }}
+            >
+              ↑ Ingest
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }

@@ -506,7 +506,7 @@ function flatMission(m: unknown): Partial<EventRow> {
   };
 }
 
-export function ingestJsonl(content: string, sourceFile: string): IngestResult {
+export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: number): IngestResult {
   const db = getWriteDb();
 
   const lines = content.split('\n').filter((l) => l.trim());
@@ -537,14 +537,26 @@ export function ingestJsonl(content: string, sourceFile: string): IngestResult {
   const counts: Record<string, number> = {};
 
   const result = db.transaction(() => {
-    const { lastInsertRowid } = db.prepare(`
-      INSERT INTO passes
-        (session_id,source_file,pass_date,pass_time,
-         start_ts_ms,end_ts_ms,mission_id,operator,station,schema_version)
-      VALUES (?,?,?,?,?,?,?,?,?,?)
-    `).run(sessionId, sourceFile, startDate, startTime, startMs, endMs, missionId, operator, station, schemaVer);
-
-    const passId = Number(lastInsertRowid);
+    let passId: number;
+    if (forcedPassId != null) {
+      db.prepare(`
+        INSERT INTO passes
+          (pass_id, session_id, source_file, pass_date, pass_time,
+           start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `).run(forcedPassId, sessionId, sourceFile, startDate, startTime,
+             startMs, endMs, missionId, operator, station, schemaVer);
+      passId = forcedPassId;
+    } else {
+      const { lastInsertRowid } = db.prepare(`
+        INSERT INTO passes
+          (session_id, source_file, pass_date, pass_time,
+           start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+      `).run(sessionId, sourceFile, startDate, startTime,
+             startMs, endMs, missionId, operator, station, schemaVer);
+      passId = Number(lastInsertRowid);
+    }
     const tbl = `pass_${passId}`;
     db.exec(passTableDDL(tbl));
 
