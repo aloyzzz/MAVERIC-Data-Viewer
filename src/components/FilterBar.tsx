@@ -1,6 +1,8 @@
 import { C } from '../lib/colors';
 import type { ColumnDef, FilterChip, TableMeta } from '../types';
 
+const LIMIT_OPTIONS = [100, 500, 1000, 5000, 10000];
+
 interface FilterBarProps {
   table: TableMeta;
   columns: ColumnDef[];
@@ -10,11 +12,13 @@ interface FilterBarProps {
   setQuery: (q: string) => void;
   rowCount: number;
   totalCount: number;
+  limit: number;
+  setLimit: (n: number) => void;
   onExport: () => void;
 }
 
 export function FilterBar({
-  table, filter, setFilter, query, setQuery, rowCount, totalCount, onExport,
+  table, filter, setFilter, query, setQuery, rowCount, totalCount, limit, setLimit, onExport,
 }: FilterBarProps) {
   return (
     <div style={{
@@ -85,9 +89,29 @@ export function FilterBar({
         </span>
       ))}
 
-      <span style={{ marginLeft: 'auto', color: C.textMuted }}>
+      <span style={{ marginLeft: 'auto', color: C.textMuted, display: 'flex', alignItems: 'center', gap: 6 }}>
         <span style={{ color: C.textPrimary }}>{rowCount.toLocaleString()}</span>
-        <span style={{ color: C.textDisabled }}> / {totalCount.toLocaleString()} rows</span>
+        <span style={{ color: C.textDisabled }}>/ {totalCount.toLocaleString()} rows</span>
+        <span style={{ color: C.textDisabled }}>·</span>
+        <span style={{ color: C.textMuted }}>limit</span>
+        <select
+          value={limit}
+          onChange={(e) => setLimit(Number(e.target.value))}
+          style={{
+            background: C.bgPanelRaised,
+            border: `1px solid ${C.borderSubtle}`,
+            borderRadius: 3,
+            color: C.textPrimary,
+            fontFamily: C.fontMono,
+            fontSize: 11,
+            padding: '1px 4px',
+            cursor: 'pointer',
+          }}
+        >
+          {LIMIT_OPTIONS.map(n => (
+            <option key={n} value={n}>{n.toLocaleString()}</option>
+          ))}
+        </select>
       </span>
       <button
         onClick={onExport}

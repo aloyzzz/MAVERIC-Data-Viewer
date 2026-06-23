@@ -11,10 +11,16 @@ import { CommandPalette } from '../components/CommandPalette';
 import { CsvExportTab } from '../components/CsvExportTab';
 import { Dashboard } from '../components/Dashboard';
 import { IngestPage } from '../components/IngestPage';
+import { ColumnFilterPanel } from '../components/ColumnFilterPanel';
+import { DecodedFramesTab, TelemetryTab, FilesTab } from '../components/DecodedFramesTab';
+import { HistoryTab } from '../components/LiveTab';
+import { BeaconEntryTab } from '../components/BeaconEntryTab';
 
 const NAV_TABS = [
   { id: '__dashboard__', label: 'Dashboard' },
   { id: '__db__', label: 'Database' },
+  { id: '__live__', label: 'History' },
+  { id: '__beacon__', label: 'Beacon Entry' },
   { id: '__export__', label: '↓ Export CSV' },
   { id: '__ingest__', label: '↑ Ingest' },
 ];
@@ -38,8 +44,11 @@ export function VariationA({ schema }: VariationAProps) {
   const [sort, setSort] = useState<SortState>({ col: 'ts_ms', dir: 'desc' });
   const [sidebarFilter, setSidebarFilter] = useState('');
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [dbSubTab, setDbSubTab] = useState<'data' | 'columns' | 'frames' | 'telemetry' | 'files'>('data');
+  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
+  const [limit, setLimit] = useState(1000);
 
-  const { rows: allRows, loading } = useTableRows(activeId);
+  const { rows: allRows, loading } = useTableRows(activeId, limit);
 
   // Use the resolved table (with fallback) so columns always matches what's displayed
   const table = allTables.find((t) => t.id === activeId) ?? allTables[0];
@@ -47,10 +56,15 @@ export function VariationA({ schema }: VariationAProps) {
 
   const filtered = useMemo(() => applyFilter(allRows, query), [allRows, query]);
   const sorted = useMemo(() => applySort(filtered, sort), [filtered, sort]);
+  const visibleColumns = useMemo(
+    () => columns.filter((c) => !hiddenColumns.has(c.id)),
+    [columns, hiddenColumns],
+  );
 
   useEffect(() => {
     setSelected(null);
     setQuery('');
+    setHiddenColumns(new Set());
     // Reset sort to ts_ms for pass event tables; use primary key for others
     if (/^pass_\d+$/.test(activeId)) {
       setSort({ col: 'ts_ms', dir: 'desc' });
@@ -116,6 +130,12 @@ export function VariationA({ schema }: VariationAProps) {
       {/* Dashboard tab */}
       {navTab === '__dashboard__' && <Dashboard schema={schema} onNavigate={(tab) => setNavTab(tab)} />}
 
+      {/* History tab */}
+      {navTab === '__live__' && <HistoryTab />}
+
+      {/* Beacon entry tab */}
+      {navTab === '__beacon__' && <BeaconEntryTab schema={schema} />}
+
       {/* Export tab */}
       {navTab === '__export__' && <CsvExportTab schema={schema} />}
 
@@ -123,7 +143,7 @@ export function VariationA({ schema }: VariationAProps) {
       {navTab === '__ingest__' && <IngestPage />}
 
       {/* 3-pane area */}
-      {navTab !== '__export__' && navTab !== '__dashboard__' && navTab !== '__ingest__' && (
+      {navTab !== '__export__' && navTab !== '__dashboard__' && navTab !== '__ingest__' && navTab !== '__live__' && navTab !== '__beacon__' && (
         <div style={{ display: 'flex', flex: 1, minHeight: 0, padding: 12 }}>
           <div style={{
             display: 'flex', flex: 1, minHeight: 0,
@@ -164,55 +184,122 @@ export function VariationA({ schema }: VariationAProps) {
                     backgroundColor: C.bgPanelRaised, color: C.textMuted,
                     fontSize: 10, fontFamily: C.fontMono,
                     border: `1px solid ${C.borderSubtle}`,
-                  }}>{columns.length} cols</span>
+                  }}>{visibleColumns.length}{hiddenColumns.size > 0 ? `/${columns.length}` : ''} cols</span>
                 </span>
               </div>
 
-              {table && (
+              {/* Database sub-tab strip */}
+              <div style={{
+                display: 'flex', alignItems: 'center',
+                height: 28, padding: '0 10px',
+                borderBottom: `1px solid ${C.borderSubtle}`,
+                backgroundColor: C.bgApp,
+                gap: 2, flexShrink: 0,
+              }}>
+                {(['data', 'frames', 'files', 'telemetry', 'columns'] as const).map((tab) => {
+                  const active = dbSubTab === tab;
+                  return (
+                    <div
+                      key={tab}
+                      onClick={() => setDbSubTab(tab)}
+                      style={{
+                        padding: '3px 10px',
+                        fontSize: 11,
+                        fontFamily: C.fontMono,
+                        color: active ? C.textPrimary : C.textMuted,
+                        backgroundColor: active ? C.bgPanelRaised : 'transparent',
+                        border: active ? `1px solid ${C.borderSubtle}` : '1px solid transparent',
+                        borderBottom: active ? `1px solid ${C.bgPanelRaised}` : '1px solid transparent',
+                        borderRadius: '3px 3px 0 0',
+                        cursor: 'pointer',
+                        display: 'flex', alignItems: 'center', gap: 5,
+                      }}
+                    >
+                      {tab === 'columns' && hiddenColumns.size > 0 && (
+                        <span style={{
+                          display: 'inline-block', width: 5, height: 5,
+                          borderRadius: '50%', backgroundColor: C.active,
+                        }} />
+                      )}
+                      {tab}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {dbSubTab === 'columns' && (
+                <ColumnFilterPanel
+                  columns={columns}
+                  hiddenColumns={hiddenColumns}
+                  setHiddenColumns={setHiddenColumns}
+                />
+              )}
+
+              {dbSubTab === 'frames' && (
+                <DecodedFramesTab tableId={activeId} />
+              )}
+
+              {dbSubTab === 'files' && (
+                <FilesTab tableId={activeId} />
+              )}
+
+              {dbSubTab === 'telemetry' && (
+                <TelemetryTab tableId={activeId} />
+              )}
+
+
+              {dbSubTab === 'data' && table && (
                 <FilterBar
                   table={table}
-                  columns={columns}
+                  columns={visibleColumns}
                   filter={filter}
                   setFilter={setFilter}
                   query={query}
                   setQuery={setQuery}
                   rowCount={sorted.length}
                   totalCount={table.rows}
-                  onExport={() => exportCsv(sorted, columns, `${activeId}.csv`)}
+                  limit={limit}
+                  setLimit={setLimit}
+                  onExport={() => exportCsv(sorted, visibleColumns, `${activeId}.csv`)}
                 />
               )}
 
-              <DataTable
-                rows={sorted}
-                columns={columns}
-                selected={selected}
-                onSelect={(r) => setSelected(selected?.__idx === r.__idx ? null : r)}
-                sort={sort}
-                onSort={onSort}
-                loading={loading}
-              />
+              {(dbSubTab === 'data') && (
+                <DataTable
+                  rows={sorted}
+                  columns={visibleColumns}
+                  selected={selected}
+                  onSelect={(r) => setSelected(selected?.__idx === r.__idx ? null : r)}
+                  sort={sort}
+                  onSort={onSort}
+                  loading={loading}
+                />
+              )}
 
-              {/* Status bar */}
-              <div style={{
-                padding: '4px 12px',
-                borderTop: `1px solid ${C.borderSubtle}`,
-                display: 'flex', alignItems: 'center', gap: 10,
-                fontFamily: C.fontMono, fontSize: 10.5,
-                color: C.textMuted, backgroundColor: C.bgApp, flexShrink: 0,
-              }}>
-                <span>SELECT * FROM {table?.label}</span>
-                {query && <span style={{ color: C.active }}>WHERE {query}</span>}
-                {sort.col && <span>ORDER BY {sort.col} {sort.dir.toUpperCase()}</span>}
-                <span style={{ marginLeft: 'auto' }}>{sorted.length.toLocaleString()} rows</span>
-              </div>
+              {/* Status bar — hidden on frames/files/telemetry/columns tabs */}
+              {dbSubTab !== 'frames' && dbSubTab !== 'files' && dbSubTab !== 'telemetry' && dbSubTab !== 'columns' && (
+                <div style={{
+                  padding: '4px 12px',
+                  borderTop: `1px solid ${C.borderSubtle}`,
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  fontFamily: C.fontMono, fontSize: 10.5,
+                  color: C.textMuted, backgroundColor: C.bgApp, flexShrink: 0,
+                }}>
+                  <span>SELECT * FROM {table?.label}</span>
+                  {query && <span style={{ color: C.active }}>WHERE {query}</span>}
+                  {sort.col && <span>ORDER BY {sort.col} {sort.dir.toUpperCase()}</span>}
+                  <span style={{ marginLeft: 'auto' }}>{sorted.length.toLocaleString()} rows</span>
+                </div>
+              )}
             </div>
 
-            {table && (
+            {table && dbSubTab === 'data' && (
               <DetailPane
                 row={selected}
                 columns={columns}
                 table={table}
                 onClose={() => setSelected(null)}
+                onPassDeleted={() => window.location.reload()}
                 position="right"
               />
             )}

@@ -10,7 +10,6 @@
     "server": "tsx server/index.ts"
   },
   "dependencies": {
-    "@rollup/rollup-linux-x64-gnu": "^4.62.2",
     "@types/multer": "^2.1.0",
     "better-sqlite3": "^12.9.0",
     "cors": "^2.8.5",

@@ -1,8 +1,24 @@
 import Database from 'better-sqlite3';
-import { resolve } from 'path';
+import { mkdirSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { resolve, join } from 'path';
 import type { ColumnDef, ColumnType, AppSchema, TableMeta } from '../src/types.js';
+import { decodeRow, parseInnerHex } from './telemetryDecode.js';
 
 const DB_PATH = resolve(process.cwd(), 'ground_station.db');
+
+const DECODED_TELEMETRY_DDL = `
+  CREATE TABLE IF NOT EXISTS decoded_telemetry (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    pass_id INTEGER NOT NULL,
+    ts_ms   INTEGER NOT NULL,
+    cmd_id  TEXT NOT NULL,
+    field   TEXT NOT NULL,
+    value   TEXT NOT NULL,
+    unit    TEXT NOT NULL DEFAULT ''
+  );
+  CREATE INDEX IF NOT EXISTS idx_dt_pass     ON decoded_telemetry (pass_id);
+  CREATE INDEX IF NOT EXISTS idx_dt_pass_cmd ON decoded_telemetry (pass_id, cmd_id);
+`;
 
 const PASSES_DDL = `
   CREATE TABLE IF NOT EXISTS passes (
@@ -366,7 +382,21 @@ function migrateOldTables(db: Database.Database): void {
 export function initDb(): void {
   const db = getWriteDb();
   db.exec(PASSES_DDL);
+  db.exec(DECODED_TELEMETRY_DDL);
   migrateOldTables(db);
+
+  // Backfill any passes that have no decoded rows yet.
+  if (tableExists(db, 'passes')) {
+    const allPasses = db.prepare('SELECT pass_id FROM passes').all() as { pass_id: number }[];
+    const decoded   = db.prepare('SELECT DISTINCT pass_id FROM decoded_telemetry').all() as { pass_id: number }[];
+    const decodedSet = new Set(decoded.map(r => r.pass_id));
+    for (const { pass_id } of allPasses) {
+      if (!decodedSet.has(pass_id) && tableExists(db, `pass_${pass_id}`)) {
+        try { materializeTelemetry(pass_id); } catch { /* skip if decode fails */ }
+      }
+    }
+  }
+
   resetReadDb();
 }
 
@@ -456,6 +486,29 @@ export function fetchRows(
   }
   sql += ` LIMIT ${limit} OFFSET ${offset}`;
 
+  return db.prepare(sql).all() as Record<string, unknown>[];
+}
+
+export function fetchFramePackets(tableId: string): Record<string, unknown>[] {
+  if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const db = getDb();
+  // Only return the columns the frames tab needs — keeps the payload small
+  const sql = `
+    SELECT
+      event_kind, event_id, ts_ms, ts_iso, seq,
+      frame_label, frame_type,
+      inner_hex, inner_len,
+      mission_facts_header_cmd_id,
+      mission_facts_header_src,
+      mission_facts_header_dest,
+      mission_facts_header_ptype,
+      mission_facts_integrity_overall_ok,
+      duplicate, uplink_echo
+    FROM "${tableId}"
+    WHERE event_kind IN ('rx_packet','tx_command')
+      AND inner_hex IS NOT NULL
+    ORDER BY ts_ms ASC
+  `;
   return db.prepare(sql).all() as Record<string, unknown>[];
 }
 
@@ -664,5 +717,278 @@ export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: 
   })() as number;
 
   resetReadDb();
+
+  // Best-effort: decode binary TLM/RES packets and save to decoded_telemetry.
+  try { materializeTelemetry(result); } catch { /* non-fatal */ }
+
   return { passId: result, sessionId, counts, skipped, warnings };
+}
+
+// ── Decoded telemetry ─────────────────────────────────────────────────────────
+
+export interface DecodedRow {
+  pass_id: number;
+  ts_ms:   number;
+  cmd_id:  string;
+  field:   string;
+  value:   string;
+  unit:    string;
+}
+
+export interface SummaryRow {
+  cmd_id: string;
+  field:  string;
+  unit:   string;
+  count:  number;
+}
+
+// Decode all TLM/RES inner_hex frames for a pass and persist to decoded_telemetry.
+// Idempotent: deletes existing rows for this pass before inserting.
+export function materializeTelemetry(passId: number): { count: number } {
+  const db = getWriteDb();
+  const tbl = `pass_${passId}`;
+  if (!tableExists(db, tbl)) throw new Error(`Table ${tbl} does not exist`);
+
+  db.prepare('DELETE FROM decoded_telemetry WHERE pass_id = ?').run(passId);
+
+  type FrameRow = { ts_ms: number; cmd_id: string; inner_hex: string };
+  const rows = db.prepare(`
+    SELECT ts_ms,
+           mission_facts_header_cmd_id AS cmd_id,
+           inner_hex
+    FROM   "${tbl}"
+    WHERE  event_kind IN ('rx_packet', 'tx_command')
+      AND  mission_facts_header_ptype IN ('TLM', 'RES')
+      AND  inner_hex IS NOT NULL AND inner_hex != ''
+    ORDER  BY ts_ms ASC
+  `).all() as FrameRow[];
+
+  const insert = db.prepare(
+    'INSERT INTO decoded_telemetry (pass_id, ts_ms, cmd_id, field, value, unit) VALUES (?, ?, ?, ?, ?, ?)',
+  );
+
+  let count = 0;
+  db.transaction(() => {
+    for (const row of rows) {
+      if (!row.cmd_id) continue;
+      const decoded = decodeRow(row.cmd_id, row.inner_hex);
+      for (const f of decoded) {
+        insert.run(passId, row.ts_ms, row.cmd_id, f.field, f.value, f.unit);
+        count++;
+      }
+    }
+  })();
+
+  return { count };
+}
+
+// Return cmd/field summary (distinct cmd_id, field, unit + count) for a set of passes.
+export function fetchDecodedSummary(passIds: number[]): SummaryRow[] {
+  if (passIds.length === 0) return [];
+  const db  = getDb();
+  const ph  = passIds.map(() => '?').join(',');
+  return db.prepare(`
+    SELECT cmd_id, field, MAX(unit) AS unit, COUNT(*) AS count
+    FROM   decoded_telemetry
+    WHERE  pass_id IN (${ph})
+    GROUP  BY cmd_id, field
+    ORDER  BY cmd_id, field
+  `).all(...passIds) as SummaryRow[];
+}
+
+// Return all decoded rows for given passes + a specific cmd_id, ordered by time.
+export function fetchDecodedTelemetry(passIds: number[], cmd: string): DecodedRow[] {
+  if (passIds.length === 0) return [];
+  const db = getDb();
+  const ph = passIds.map(() => '?').join(',');
+  return db.prepare(`
+    SELECT pass_id, ts_ms, cmd_id, field, value, unit
+    FROM   decoded_telemetry
+    WHERE  pass_id IN (${ph}) AND cmd_id = ?
+    ORDER  BY ts_ms ASC
+  `).all(...passIds, cmd) as DecodedRow[];
+}
+
+// Return { pass_id -> decoded row count } for a set of passes.
+export function fetchDecodeStatus(passIds: number[]): Record<number, number> {
+  if (passIds.length === 0) return {};
+  const db  = getDb();
+  const ph  = passIds.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT pass_id, COUNT(*) AS cnt
+    FROM   decoded_telemetry
+    WHERE  pass_id IN (${ph})
+    GROUP  BY pass_id
+  `).all(...passIds) as { pass_id: number; cnt: number }[];
+  return Object.fromEntries(rows.map(r => [r.pass_id, r.cnt]));
+}
+
+/* ─── Manual beacon entry ─────────────────────────────────────────────────── */
+
+export interface BeaconPreview {
+  lineIndex: number;
+  hex: string;
+  cmdId: string | null;
+  fields: { field: string; value: string; unit: string }[];
+  error: string | null;
+}
+
+export function previewBeacons(hexLines: string[]): BeaconPreview[] {
+  return hexLines.map((raw, lineIndex) => {
+    const hex = raw.trim().replace(/\s+/g, '');
+    if (!hex) return { lineIndex, hex: '', cmdId: null, fields: [], error: 'Empty line' };
+    if (!/^[0-9a-fA-F]+$/.test(hex)) {
+      return { lineIndex, hex, cmdId: null, fields: [], error: 'Not valid hex' };
+    }
+    try {
+      const parsed = parseInnerHex(hex);
+      if (!parsed) return { lineIndex, hex, cmdId: null, fields: [], error: 'Could not parse inner frame structure' };
+      const fields = decodeRow(parsed.cmdName, hex);
+      return { lineIndex, hex, cmdId: parsed.cmdName, fields, error: null };
+    } catch (e) {
+      return { lineIndex, hex, cmdId: null, fields: [], error: String(e) };
+    }
+  }).filter(p => p.hex !== '');
+}
+
+export function insertBeacons(passId: number, hexLines: string[]): number {
+  const db = getDb();
+  const tableName = `pass_${passId}`;
+  if (!tableExists(db, tableName)) throw new Error(`Pass ${passId} does not exist`);
+
+  const colList = EVENT_COLS.join(', ');
+  const phList = EVENT_COLS.map(() => '?').join(', ');
+  const stmt = db.prepare(`INSERT INTO "${tableName}" (${colList}) VALUES (${phList})`);
+
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+
+  let count = 0;
+  db.transaction(() => {
+    for (const raw of hexLines) {
+      const hex = raw.trim().replace(/\s+/g, '');
+      if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) continue;
+      const parsed = parseInnerHex(hex);
+      const row = emptyRow();
+      row['event_kind'] = 'rx_packet';
+      row['ts_ms'] = now;
+      row['ts_iso'] = nowIso;
+      row['inner_hex'] = hex;
+      row['inner_len'] = hex.length / 2;
+      row['mission_facts_header_cmd_id'] = parsed?.cmdName ?? null;
+      row['mission_facts_header_ptype'] = 'TLM';
+      stmt.run(EVENT_COLS.map((c) => row[c]));
+      count++;
+    }
+  })();
+
+  materializeTelemetry(passId);
+  resetReadDb();
+  return count;
+}
+
+export function deletePass(passId: number): void {
+  const db = getDb();
+  db.exec(`DROP TABLE IF EXISTS pass_${passId}`);
+  db.prepare('DELETE FROM passes WHERE pass_id = ?').run(passId);
+  db.prepare('DELETE FROM decoded_telemetry WHERE pass_id = ?').run(passId);
+  resetReadDb();
+}
+
+/* ─── File assembly ───────────────────────────────────────────────────────── */
+
+export const FILES_DIR = resolve(process.cwd(), 'assembled_files');
+
+const INNER_HDR = 8;
+
+function parseInnerHexServer(hex: string): Buffer | null {
+  if (!hex || hex.length < (INNER_HDR + 2) * 2) return null;
+  try {
+    const b = Buffer.from(hex, 'hex');
+    if (b.length < INNER_HDR + 2) return null;
+    const nameLen = b[INNER_HDR];
+    const argsLen = b[INNER_HDR + 1];
+    const argsStart = INNER_HDR + 2 + nameLen + 1;
+    if (argsStart > b.length) return null;
+    return b.subarray(argsStart, argsStart + argsLen);
+  } catch {
+    return null;
+  }
+}
+
+function parseFileChunkServer(
+  args: Buffer,
+): { filename: string; index: number; data: Buffer } | null {
+  let pos = 0;
+  const tokens: string[] = [];
+  while (tokens.length < 3 && pos < args.length) {
+    while (pos < args.length && args[pos] === 0x20) pos++;
+    if (pos >= args.length || args[pos] < 0x21 || args[pos] > 0x7e) break;
+    let end = pos;
+    while (end < args.length && args[end] !== 0x20 && args[end] >= 0x20 && args[end] <= 0x7e) end++;
+    tokens.push(args.subarray(pos, end).toString('ascii'));
+    pos = end;
+  }
+  while (pos < args.length && args[pos] === 0x20) pos++;
+  if (tokens.length < 2) return null;
+  const idx = parseInt(tokens[1]);
+  if (isNaN(idx)) return null;
+  const size = tokens.length >= 3 ? parseInt(tokens[2]) : args.length - pos;
+  return { filename: tokens[0], index: idx, data: args.subarray(pos, pos + size) };
+}
+
+export interface AssembledFileInfo {
+  filename: string;
+  totalBytes: number;
+  chunkCount: number;
+}
+
+export function assembleFilesForTable(tableId: string): AssembledFileInfo[] {
+  if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const db = getDb();
+
+  const rows = db.prepare(`
+    SELECT inner_hex
+    FROM "${tableId}"
+    WHERE event_kind = 'rx_packet'
+      AND mission_facts_header_ptype = 'FILE'
+      AND inner_hex IS NOT NULL
+    ORDER BY ts_ms ASC
+  `).all() as { inner_hex: string }[];
+
+  // filename → Map<index, Buffer>
+  const fileMap = new Map<string, Map<number, Buffer>>();
+
+  for (const row of rows) {
+    const argsBytes = parseInnerHexServer(row.inner_hex);
+    if (!argsBytes || argsBytes.length === 0) continue;
+    const chunk = parseFileChunkServer(argsBytes);
+    if (!chunk || chunk.data.length === 0) continue;
+    if (!fileMap.has(chunk.filename)) fileMap.set(chunk.filename, new Map());
+    const chunks = fileMap.get(chunk.filename)!;
+    if (!chunks.has(chunk.index)) chunks.set(chunk.index, chunk.data);
+  }
+
+  const outDir = join(FILES_DIR, tableId);
+  mkdirSync(outDir, { recursive: true });
+
+  const results: AssembledFileInfo[] = [];
+  for (const [filename, chunks] of fileMap) {
+    const sorted = [...chunks.keys()].sort((a, b) => a - b).map(i => chunks.get(i)!);
+    const assembled = Buffer.concat(sorted);
+    writeFileSync(join(outDir, filename), assembled);
+    results.push({ filename, totalBytes: assembled.length, chunkCount: chunks.size });
+  }
+  return results;
+}
+
+export function listAssembledFiles(tableId: string): AssembledFileInfo[] {
+  if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const dir = join(FILES_DIR, tableId);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).map(name => ({
+    filename: name,
+    totalBytes: statSync(join(dir, name)).size,
+    chunkCount: 0,
+  }));
 }

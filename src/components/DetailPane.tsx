@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { C, toneOf, toneColor, frameColor } from '../lib/colors';
 import type { ColumnDef, Row, TableMeta } from '../types';
 import { Sparkline } from './Sparkline';
@@ -7,6 +8,7 @@ interface DetailPaneProps {
   columns: ColumnDef[];
   table: TableMeta;
   onClose: () => void;
+  onPassDeleted?: () => void;
   position?: 'right' | 'bottom';
 }
 
@@ -27,10 +29,15 @@ function btnStyle(tone?: string) {
   } as const;
 }
 
-export function DetailPane({ row, columns, table, onClose, position = 'right' }: DetailPaneProps) {
+export function DetailPane({ row, columns, table, onClose, onPassDeleted, position = 'right' }: DetailPaneProps) {
   const sizeStyle = position === 'right'
     ? { flex: '0 0 360px', borderLeft: `1px solid ${C.borderSubtle}` }
     : { flex: '0 0 240px', borderTop: `1px solid ${C.borderSubtle}` };
+
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [passwordInput, setPasswordInput] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
   if (!row) {
     return (
@@ -57,6 +64,38 @@ export function DetailPane({ row, columns, table, onClose, position = 'right' }:
     const { __idx, ...data } = row;
     navigator.clipboard.writeText(JSON.stringify(data, null, 2));
   };
+
+  const handleDeletePass = async () => {
+    if (deletePassId == null) return;
+    setDeleting(true);
+    setDeleteError('');
+    try {
+      const resp = await fetch(`/api/passes/${deletePassId}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: passwordInput }),
+      });
+      if (!resp.ok) {
+        const body = await resp.json() as { error?: string };
+        setDeleteError(body.error ?? 'Delete failed');
+        setDeleting(false);
+        return;
+      }
+      setShowDeleteModal(false);
+      onClose();
+      onPassDeleted?.();
+    } catch (e) {
+      setDeleteError(String(e));
+      setDeleting(false);
+    }
+  };
+
+  const isPassesTable = table.id === 'passes';
+  const passEventMatch = /^pass_(\d+)$/.exec(table.id);
+  const deletePassId: number | null = isPassesTable
+    ? (row['pass_id'] != null ? Number(row['pass_id']) : null)
+    : passEventMatch ? Number(passEventMatch[1]) : null;
+  const showDeleteBtn = deletePassId != null;
 
   return (
     <div style={{
@@ -135,7 +174,78 @@ export function DetailPane({ row, columns, table, onClose, position = 'right' }:
       }}>
         <button onClick={handleCopyJson} style={btnStyle()}>Copy JSON</button>
         <button style={btnStyle('info')}>Open FK</button>
+        {showDeleteBtn && (
+          <button
+            onClick={() => { setPasswordInput(''); setDeleteError(''); setShowDeleteModal(true); }}
+            style={{ ...btnStyle('danger'), marginLeft: 'auto' }}
+          >
+            Delete Pass
+          </button>
+        )}
       </div>
+
+      {showDeleteModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1000,
+          backgroundColor: 'rgba(0,0,0,0.65)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}
+          onClick={(e) => { if (e.target === e.currentTarget) setShowDeleteModal(false); }}
+        >
+          <div style={{
+            backgroundColor: C.bgPanel,
+            border: `1px solid ${C.borderStrong}`,
+            borderRadius: 6,
+            padding: 24,
+            width: 320,
+            fontFamily: C.fontMono,
+            fontSize: 12,
+          }}>
+            <div style={{ color: C.danger, fontWeight: 600, marginBottom: 12, fontSize: 13 }}>
+              Delete Pass {deletePassId}
+            </div>
+            <div style={{ color: C.textMuted, marginBottom: 16, fontSize: 11, lineHeight: 1.5 }}>
+              This will permanently delete the pass, all its events, and all decoded telemetry.
+              This action cannot be undone.
+            </div>
+            <div style={{ marginBottom: 8, color: C.textMuted, fontSize: 10.5 }}>Password</div>
+            <input
+              type="password"
+              autoFocus
+              value={passwordInput}
+              onChange={(e) => setPasswordInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleDeletePass(); if (e.key === 'Escape') setShowDeleteModal(false); }}
+              placeholder="enter password"
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                backgroundColor: C.bgApp, color: C.textPrimary,
+                border: `1px solid ${C.borderStrong}`, borderRadius: 3,
+                padding: '6px 8px', fontFamily: C.fontMono, fontSize: 12,
+                marginBottom: 6,
+                outline: 'none',
+              }}
+            />
+            {deleteError && (
+              <div style={{ color: C.danger, fontSize: 10.5, marginBottom: 8 }}>{deleteError}</div>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowDeleteModal(false)}
+                style={btnStyle()}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeletePass}
+                disabled={deleting || !passwordInput}
+                style={{ ...btnStyle('danger'), opacity: (deleting || !passwordInput) ? 0.5 : 1 }}
+              >
+                {deleting ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

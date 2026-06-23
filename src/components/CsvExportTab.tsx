@@ -122,7 +122,7 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
   const [passIdTo, setPassIdTo]           = useState('');
 
   /* fetch rows for selected table */
-  const { rows: allRows, loading } = useTableRows(selectedTableId);
+  const { rows: allRows, loading } = useTableRows(selectedTableId, 10000);
   const columns  = schema.columns[selectedTableId] ?? [];
   const table    = allTables.find((t) => t.id === selectedTableId) ?? allTables[0];
 

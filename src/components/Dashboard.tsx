@@ -234,7 +234,7 @@ function ActivityChart({
 /* ─── main dashboard ─────────────────────────────────────────────────────── */
 
 export function Dashboard({ schema, onNavigate }: DashboardProps) {
-  const { rows: passRows, loading: lPass } = useTableRows('passes');
+  const { rows: passRows, loading: lPass } = useTableRows('passes', 10000);
 
   /* ── pick latest pass by pass_id ── */
   const latestPass = useMemo(() =>
@@ -248,7 +248,7 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
 
   /* ── load all events for the latest pass in one fetch ── */
   const passTableId: string | null = latestPass ? `pass_${latestPass['pass_id']}` : null;
-  const { rows: allEventRows, loading: lEvents } = useTableRows(passTableId);
+  const { rows: allEventRows, loading: lEvents } = useTableRows(passTableId, 10000);
 
   const loading = lPass || lEvents;
 
