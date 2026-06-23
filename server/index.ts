@@ -5,13 +5,16 @@ import { initDb } from './db.js';
 
 const PORT = 3001;
 
-initDb();
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use('/api', router);
 
-app.listen(PORT, () => {
-  console.log(`GSS API server running at http://localhost:${PORT}`);
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`GSS API server running at http://localhost:${PORT}`);
+  });
+}).catch((err) => {
+  console.error('Failed to initialize database:', err);
+  process.exit(1);
 });
