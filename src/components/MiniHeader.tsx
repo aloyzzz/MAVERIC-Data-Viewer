@@ -37,14 +37,6 @@ export function MiniHeader() {
         <span style={{ fontWeight: 700, fontSize: 13, letterSpacing: '0.02em', color: C.textPrimary }}>
           MAVERIC <span style={{ color: C.active }}>DB</span>
         </span>
-        <span style={{ fontSize: 11, color: C.textDisabled }}>v6.1.0</span>
-      </div>
-
-      <span style={{ color: C.borderStrong, fontSize: 11 }}>|</span>
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 8, fontFamily: C.fontMono, fontSize: 11 }}>
-        <span style={{ textTransform: 'uppercase', color: C.textMuted, fontSize: 10, letterSpacing: '0.04em' }}>OP</span>
-        <span style={{ color: C.textSecondary }}>lcurry@SCFA-LAX</span>
       </div>
 
       {/* Right cluster */}

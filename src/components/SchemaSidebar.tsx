@@ -119,8 +119,6 @@ export function SchemaSidebar({ schemas, activeId, onPick, sidebarFilter, setSid
       }}>
         <div>sqlite://ground_station.db</div>
         <div style={{ display: 'flex', gap: 8, marginTop: 2 }}>
-          <span>v6.1.0</span>
-          <span style={{ color: C.textMuted }}>·</span>
           <span>readonly</span>
           <span style={{ marginLeft: 'auto', color: C.success }}>●</span>
         </div>
