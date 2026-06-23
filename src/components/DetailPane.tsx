@@ -10,7 +10,8 @@ interface DetailPaneProps {
   position?: 'right' | 'bottom';
 }
 
-const SPARKLINE_TABLES = new Set(['eps_battery', 'gnc_attitude', 'parameters_cache', 'event_parameter']);
+// Sparkline demo only shown for pass event tables (pattern pass_<id>)
+function isPassTable(id: string) { return /^pass_\d+$/.test(id); }
 
 function btnStyle(tone?: string) {
   const clr = tone ? toneColor(tone as Parameters<typeof toneColor>[0]) : C.textMuted;
@@ -117,7 +118,7 @@ export function DetailPane({ row, columns, table, onClose, position = 'right' }:
           );
         })}
 
-        {SPARKLINE_TABLES.has(table.id) && (
+        {isPassTable(table.id) && (
           <div style={{ padding: '10px 12px', borderBottom: `1px solid ${C.borderSubtle}` }}>
             <div style={{ fontSize: 10, color: C.textMuted, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
               ◊ value · last 60 samples

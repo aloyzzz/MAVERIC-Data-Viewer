@@ -99,8 +99,11 @@ interface CsvExportTabProps {
 export function CsvExportTab({ schema }: CsvExportTabProps) {
   const allTables = schema.schemas.flatMap((s) => s.tables);
 
-  /* table selection */
-  const [selectedTableId, setSelectedTableId] = useState('event_parameter');
+  /* table selection — default to first pass event table */
+  const [selectedTableId, setSelectedTableId] = useState(() => {
+    const passGroup = schema.schemas.find((s) => s.name === 'passes');
+    return passGroup?.tables[0]?.id ?? allTables[0]?.id ?? '';
+  });
 
   /* batch mode */
   const [batchMode, setBatchMode] = useState(false);
@@ -135,7 +138,9 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
 
   const hasTsMs      = columns.some((c) => c.id === 'ts_ms');
   const hasPassId    = columns.some((c) => c.id === 'pass_id');
-  const isParamTable = selectedTableId === 'event_parameter';
+  // Pass event tables contain parameter rows mixed with other event kinds; treat
+  // any table with a 'name' column as having filterable parameter names.
+  const isParamTable = columns.some((c) => c.id === 'name');
 
   /* pass id range available in this table */
   const passIdRange = useMemo(() => {

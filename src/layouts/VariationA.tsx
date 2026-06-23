@@ -24,8 +24,14 @@ interface VariationAProps {
 }
 
 export function VariationA({ schema }: VariationAProps) {
+  const allTables = schema.schemas.flatMap((s) => s.tables);
+
   const [navTab, setNavTab] = useState('__dashboard__');
-  const [activeId, setActiveId] = useState('event_parameter');
+  const [activeId, setActiveId] = useState(() => {
+    // Default to the first pass event table, falling back to the first table in schema
+    const passGroup = schema.schemas.find((s) => s.name === 'passes');
+    return passGroup?.tables[0]?.id ?? allTables[0]?.id ?? '';
+  });
   const [selected, setSelected] = useState<Row | null>(null);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<FilterChip[]>([]);
@@ -34,14 +40,26 @@ export function VariationA({ schema }: VariationAProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   const { rows: allRows, loading } = useTableRows(activeId);
-  const columns = schema.columns[activeId] ?? [];
-  const allTables = schema.schemas.flatMap((s) => s.tables);
+
+  // Use the resolved table (with fallback) so columns always matches what's displayed
   const table = allTables.find((t) => t.id === activeId) ?? allTables[0];
+  const columns = schema.columns[table?.id ?? activeId] ?? [];
 
   const filtered = useMemo(() => applyFilter(allRows, query), [allRows, query]);
   const sorted = useMemo(() => applySort(filtered, sort), [filtered, sort]);
 
-  useEffect(() => { setSelected(null); }, [activeId]);
+  useEffect(() => {
+    setSelected(null);
+    setQuery('');
+    // Reset sort to ts_ms for pass event tables; use primary key for others
+    if (/^pass_\d+$/.test(activeId)) {
+      setSort({ col: 'ts_ms', dir: 'desc' });
+    } else {
+      const t = allTables.find((t) => t.id === activeId);
+      setSort({ col: t?.primary ?? 'id', dir: 'asc' });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {

@@ -234,21 +234,31 @@ function ActivityChart({
 /* ─── main dashboard ─────────────────────────────────────────────────────── */
 
 export function Dashboard({ schema, onNavigate }: DashboardProps) {
-  const { rows: passRows,     loading: lPass  } = useTableRows('passes');
-  const { rows: rxRows,       loading: lRx    } = useTableRows('event_rx_packet');
-  const { rows: txRows,       loading: lTx    } = useTableRows('event_tx_command');
-  const { rows: paramRows,    loading: lParam } = useTableRows('event_parameter');
-  const { rows: alarmRows,    loading: lAlarm } = useTableRows('event_alarm');
-  const { rows: verifierRows, loading: lVerif } = useTableRows('event_cmd_verifier');
-  const { rows: radioRows                      } = useTableRows('event_radio');
+  const { rows: passRows, loading: lPass } = useTableRows('passes');
 
-  const loading = lPass || lRx || lTx || lParam || lAlarm || lVerif;
+  /* ── pick latest pass by pass_id ── */
+  const latestPass = useMemo(() =>
+    passRows.length > 0
+      ? passRows.reduce((best, r) =>
+          Number(r['pass_id']) > Number(best['pass_id']) ? r : best)
+      : undefined,
+    [passRows],
+  );
+  const pass = latestPass;
 
-  /* ── pass metadata — pick latest by pass_id ── */
-  const pass = passRows.length > 0
-    ? passRows.reduce((latest, r) =>
-        Number(r['pass_id']) > Number(latest['pass_id']) ? r : latest)
-    : undefined;
+  /* ── load all events for the latest pass in one fetch ── */
+  const passTableId: string | null = latestPass ? `pass_${latestPass['pass_id']}` : null;
+  const { rows: allEventRows, loading: lEvents } = useTableRows(passTableId);
+
+  const loading = lPass || lEvents;
+
+  /* ── split event rows by kind ── */
+  const rxRows       = useMemo(() => allEventRows.filter((r) => r['event_kind'] === 'rx_packet'),    [allEventRows]);
+  const txRows       = useMemo(() => allEventRows.filter((r) => r['event_kind'] === 'tx_command'),   [allEventRows]);
+  const paramRows    = useMemo(() => allEventRows.filter((r) => r['event_kind'] === 'parameter'),    [allEventRows]);
+  const alarmRows    = useMemo(() => allEventRows.filter((r) => r['event_kind'] === 'alarm'),        [allEventRows]);
+  const verifierRows = useMemo(() => allEventRows.filter((r) => r['event_kind'] === 'cmd_verifier'), [allEventRows]);
+  const radioRows    = useMemo(() => allEventRows.filter((r) => r['event_kind'] === 'radio'),        [allEventRows]);
 
   const duration = useMemo(() => {
     if (!pass) return null;
