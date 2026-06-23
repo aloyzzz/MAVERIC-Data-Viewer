@@ -23,9 +23,10 @@ router.post('/ingest', upload.single('file'), (req, res) => {
     if (!req.file) { res.status(400).json({ error: 'No file uploaded' }); return; }
     const { originalname, buffer } = req.file;
     const content = buffer.toString('utf-8');
+    const forcedPassId = req.body?.passId ? parseInt(req.body.passId as string, 10) : undefined;
 
     if (originalname.endsWith('.jsonl') || originalname.endsWith('.ndjson')) {
-      const result = ingestJsonl(content, originalname);
+      const result = ingestJsonl(content, originalname, forcedPassId);
       // Invalidate schema cache so row counts refresh
       schemaCache = null;
       res.json(result);
