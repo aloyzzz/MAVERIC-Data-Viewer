@@ -117,9 +117,8 @@ export function SchemaSidebar({ schemas, activeId, onPick, sidebarFilter, setSid
         fontSize: 10, fontFamily: C.fontMono,
         color: C.textDisabled, lineHeight: 1.4,
       }}>
-        <div>sqlite://ground_station.db</div>
+        <div>postgresql://maveric_gs</div>
         <div style={{ display: 'flex', gap: 8, marginTop: 2 }}>
-          <span>readonly</span>
           <span style={{ marginLeft: 'auto', color: C.success }}>●</span>
         </div>
       </div>

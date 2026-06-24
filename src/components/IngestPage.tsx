@@ -179,7 +179,7 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
           </span>
           <span style={{ fontSize: 15, ...mono, color: C.textPrimary }}>Database Ingestion</span>
           <span style={{ fontSize: 11, color: C.textDisabled, ...mono }}>
-            Import a .jsonl pass file into ground_station.db
+            Import a .jsonl pass file into PostgreSQL
           </span>
         </div>
 

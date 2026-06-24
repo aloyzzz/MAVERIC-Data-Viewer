@@ -35,7 +35,7 @@ export function App() {
         backgroundColor: C.bgApp, color: C.textMuted,
         fontFamily: C.fontMono, fontSize: 12,
       }}>
-        loading ground_station.db…
+        loading…
       </div>
     );
   }
