@@ -6,7 +6,8 @@ import {
   loadSchema, fetchRows, fetchFramePackets, ingestJsonl,
   assembleFilesForTable, listAssembledFiles, FILES_DIR,
   materializeTelemetry, fetchDecodedSummary, fetchDecodedTelemetry, fetchDecodeStatus,
-  deletePass, previewBeacons, insertBeacons,
+  deletePass, previewBeacons, insertBeacons, exportDatabase, fetchAllParameters,
+  fetchParameterHistory,
 } from './db.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
@@ -133,6 +134,16 @@ router.get('/history/data', async (req, res) => {
   }
 });
 
+router.get('/history/params', async (req, res) => {
+  const passIds = parsePassIds(req.query.passIds);
+  if (passIds.length === 0) { res.json([]); return; }
+  try {
+    res.json(await fetchParameterHistory(passIds));
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 router.get('/history/status', async (req, res) => {
   try {
     res.json(await fetchDecodeStatus(parsePassIds(req.query.passIds)));
@@ -167,6 +178,26 @@ router.post('/beacons/insert', async (req, res) => {
     const count = await insertBeacons(Number(passId), hexLines);
     schemaCache = null;
     res.json({ count });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get('/params', async (_req, res) => {
+  try {
+    res.json(await fetchAllParameters());
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get('/export', async (_req, res) => {
+  try {
+    const data = await exportDatabase();
+    const filename = `maveric_export_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/json');
+    res.send(JSON.stringify(data, null, 2));
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

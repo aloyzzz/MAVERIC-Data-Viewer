@@ -408,6 +408,68 @@ export async function fetchFramePackets(tableId: string): Promise<Record<string,
   return res.rows;
 }
 
+// ── Parameters ───────────────────────────────────────────────────────────────
+
+export interface ParameterRow {
+  pass_id: number;
+  ts_ms: number;
+  ts_iso: string;
+  name: string;
+  value: string;
+  unit: string;
+}
+
+export async function fetchAllParameters(): Promise<ParameterRow[]> {
+  const client = await pool.connect();
+  try {
+    const tablesRes = await client.query<{ name: string }>(`
+      SELECT table_name AS name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'
+        AND table_name ~ '^pass_[0-9]+$'
+      ORDER BY table_name
+    `);
+
+    const results: ParameterRow[] = [];
+    for (const { name } of tablesRes.rows) {
+      const passId = parseInt(name.slice(5), 10);
+      const res = await client.query<{ ts_ms: number; ts_iso: string; name: string; value: string; unit: string }>(
+        `SELECT ts_ms, ts_iso, name, value, unit FROM "${name}" WHERE event_kind = 'parameter' ORDER BY ts_ms`,
+      );
+      for (const r of res.rows) {
+        results.push({ pass_id: passId, ts_ms: r.ts_ms, ts_iso: r.ts_iso, name: r.name ?? '', value: r.value ?? '', unit: r.unit ?? '' });
+      }
+    }
+    return results;
+  } finally {
+    client.release();
+  }
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+
+export async function exportDatabase(): Promise<Record<string, unknown[]>> {
+  const client = await pool.connect();
+  try {
+    const tablesRes = await client.query<{ name: string }>(`
+      SELECT table_name AS name
+      FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+      ORDER BY table_name
+    `);
+
+    const out: Record<string, unknown[]> = {};
+    for (const { name } of tablesRes.rows) {
+      const res = await client.query(`SELECT * FROM "${name}"`);
+      out[name] = res.rows;
+    }
+    return out;
+  } finally {
+    client.release();
+  }
+}
+
 // ── Ingestion ─────────────────────────────────────────────────────────────────
 
 type JsonEvent = Record<string, unknown>;
@@ -699,7 +761,89 @@ export async function fetchDecodedSummary(passIds: number[]): Promise<SummaryRow
     GROUP  BY cmd_id, field
     ORDER  BY cmd_id, field
   `, passIds);
-  return res.rows as SummaryRow[];
+
+  // Append parameter names grouped by their source packet's cmd_id (joined via rx_event_id).
+  // Each group gets cmd_id = 'param:<source_cmd_id>' so they appear as separate sidebar categories.
+  const client = await pool.connect();
+  try {
+    // Accumulate across passes: Map<`param:X`, Map<field, {unit, count}>>
+    const acc = new Map<string, Map<string, { unit: string; count: number }>>();
+    for (const passId of passIds) {
+      const tbl = `pass_${passId}`;
+      const exists = await tableExists(client, tbl);
+      if (!exists) continue;
+      const pr = await client.query<{ cmd_id: string; name: string; unit: string; cnt: string }>(`
+        SELECT
+          CASE WHEN r.mission_facts_header_cmd_id IS NOT NULL AND r.mission_facts_header_cmd_id != ''
+               THEN 'param:' || r.mission_facts_header_cmd_id
+               ELSE 'param:unknown'
+          END AS cmd_id,
+          p.name,
+          MAX(p.unit) AS unit,
+          COUNT(*) AS cnt
+        FROM "${tbl}" p
+        LEFT JOIN "${tbl}" r
+          ON r.event_id = p.rx_event_id AND r.event_kind = 'rx_packet'
+        WHERE p.event_kind = 'parameter' AND p.name IS NOT NULL AND p.name != ''
+        GROUP BY cmd_id, p.name
+        ORDER BY cmd_id, p.name
+      `);
+      for (const r of pr.rows) {
+        if (!acc.has(r.cmd_id)) acc.set(r.cmd_id, new Map());
+        const fields = acc.get(r.cmd_id)!;
+        const existing = fields.get(r.name);
+        if (existing) {
+          existing.count += Number(r.cnt);
+        } else {
+          fields.set(r.name, { unit: r.unit ?? '', count: Number(r.cnt) });
+        }
+      }
+    }
+    const paramRows: SummaryRow[] = [];
+    for (const [cmdId, fields] of acc) {
+      for (const [field, { unit, count }] of fields) {
+        paramRows.push({ cmd_id: cmdId, field, unit, count });
+      }
+    }
+    return [...res.rows as SummaryRow[], ...paramRows];
+  } finally {
+    client.release();
+  }
+}
+
+export async function fetchParameterHistory(passIds: number[]): Promise<DecodedRow[]> {
+  if (passIds.length === 0) return [];
+  const client = await pool.connect();
+  try {
+    const results: DecodedRow[] = [];
+    for (const passId of passIds) {
+      const tbl = `pass_${passId}`;
+      const exists = await tableExists(client, tbl);
+      if (!exists) continue;
+      const res = await client.query<{ ts_ms: number; cmd_id: string; name: string; value: string; unit: string }>(`
+        SELECT
+          p.ts_ms,
+          CASE WHEN r.mission_facts_header_cmd_id IS NOT NULL AND r.mission_facts_header_cmd_id != ''
+               THEN 'param:' || r.mission_facts_header_cmd_id
+               ELSE 'param:unknown'
+          END AS cmd_id,
+          p.name,
+          p.value,
+          p.unit
+        FROM "${tbl}" p
+        LEFT JOIN "${tbl}" r
+          ON r.event_id = p.rx_event_id AND r.event_kind = 'rx_packet'
+        WHERE p.event_kind = 'parameter' AND p.name IS NOT NULL AND p.name != ''
+        ORDER BY p.ts_ms ASC
+      `);
+      for (const r of res.rows) {
+        results.push({ pass_id: passId, ts_ms: r.ts_ms, cmd_id: r.cmd_id, field: r.name, value: r.value ?? '', unit: r.unit ?? '' });
+      }
+    }
+    return results;
+  } finally {
+    client.release();
+  }
 }
 
 export async function fetchDecodedTelemetry(passIds: number[], cmd: string): Promise<DecodedRow[]> {

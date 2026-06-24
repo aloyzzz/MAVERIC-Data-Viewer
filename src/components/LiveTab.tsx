@@ -92,6 +92,11 @@ function fmtY(v: number): string {
 
 function snap(v: number): number { return Math.round(v / SNAP_PX) * SNAP_PX; }
 
+function fmtCmd(cmd: string): string {
+  if (cmd.startsWith('param:')) return cmd.slice(6) + ' (params)';
+  return cmd;
+}
+
 function fmtDate(d: string, t: string) {
   return `${d} ${t}`.trim() || '—';
 }
@@ -406,22 +411,41 @@ export function HistoryTab() {
       return;
     }
     setDataLoading(true);
-    Promise.all(
-      [...activeCmds].map(cmd =>
-        fetch(`/api/history/data?passIds=${selectedKey}&cmd=${encodeURIComponent(cmd)}`)
+    const paramCmds = [...activeCmds].filter(c => c.startsWith('param:'));
+    const decodedCmds = [...activeCmds].filter(c => !c.startsWith('param:'));
+
+    // Fetch all param categories in one request, then split by cmd_id
+    const paramPromise: Promise<[string, DecodedRow[]][]> = paramCmds.length === 0
+      ? Promise.resolve([])
+      : fetch(`/api/history/params?passIds=${selectedKey}`)
           .then(r => r.json() as Promise<DecodedRow[]>)
-          .then(rows => [cmd, rows] as [string, DecodedRow[]]),
-      ),
-    ).then(results => {
-      const next = new Map(results);
-      setHistoryDataByCmd(next);
-      setDataLoading(false);
-      const allTimes = results.flatMap(([, rows]) => rows.map(r => r.ts_ms)).filter(t => t > 0);
-      if (allTimes.length > 0 && !rangeStart) {
-        setRangeStart(msToInput(Math.min(...allTimes)));
-        setRangeEnd(msToInput(Math.max(...allTimes)));
-      }
-    }).catch(() => setDataLoading(false));
+          .then(rows => {
+            const byCmd = new Map<string, DecodedRow[]>();
+            for (const row of rows) {
+              if (!byCmd.has(row.cmd_id)) byCmd.set(row.cmd_id, []);
+              byCmd.get(row.cmd_id)!.push(row);
+            }
+            return [...byCmd.entries()];
+          });
+
+    const decodedPromises = decodedCmds.map(cmd =>
+      fetch(`/api/history/data?passIds=${selectedKey}&cmd=${encodeURIComponent(cmd)}`)
+        .then(r => r.json() as Promise<DecodedRow[]>)
+        .then(rows => [cmd, rows] as [string, DecodedRow[]]),
+    );
+
+    Promise.all([paramPromise, Promise.all(decodedPromises)])
+      .then(([paramResults, decodedResults]) => {
+        const results: [string, DecodedRow[]][] = [...paramResults, ...decodedResults];
+        const next = new Map(results);
+        setHistoryDataByCmd(next);
+        setDataLoading(false);
+        const allTimes = results.flatMap(([, rows]) => rows.map(r => r.ts_ms)).filter(t => t > 0);
+        if (allTimes.length > 0 && !rangeStart) {
+          setRangeStart(msToInput(Math.min(...allTimes)));
+          setRangeEnd(msToInput(Math.max(...allTimes)));
+        }
+      }).catch(() => setDataLoading(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey, activeCmdsKey]);
 
@@ -833,7 +857,7 @@ export function HistoryTab() {
                         color: on ? C.active : C.textMuted,
                         border: `1px solid ${on ? `${C.active}44` : C.borderSubtle}`,
                       }}
-                    >{cmd}</button>
+                    >{fmtCmd(cmd)}</button>
                   );
                 })}
               </div>
@@ -904,7 +928,7 @@ export function HistoryTab() {
                             padding: '3px 12px', fontSize: 8.5, fontFamily: C.fontMono,
                             color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.08em',
                             backgroundColor: C.bgApp, borderBottom: `1px solid ${C.borderSubtle}`,
-                          }}>{cmd}</div>
+                          }}>{fmtCmd(cmd)}</div>
                           {cmdFields.map((f, i) => <FieldRow key={f.cmd_id + ':' + f.field} f={f} i={i} fieldColorMap={fieldColorMap} selectedFields={selectedFields} toggleField={toggleField} />)}
                         </div>
                       );

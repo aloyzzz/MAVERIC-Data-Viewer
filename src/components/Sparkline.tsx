@@ -6,10 +6,12 @@ interface SparklineProps {
   color?: string;
   points?: number;
   height?: number;
+  data?: number[];
 }
 
-export function Sparkline({ seed = 0, color = C.active, points = 60, height = 36 }: SparklineProps) {
+export function Sparkline({ seed = 0, color = C.active, points = 60, height = 36, data: rawData }: SparklineProps) {
   const data = useMemo(() => {
+    if (rawData && rawData.length > 1) return rawData;
     const r = (n: number) => {
       const x = Math.sin(seed * 9.3 + n * 1.7) * 10000;
       return x - Math.floor(x);
@@ -17,7 +19,7 @@ export function Sparkline({ seed = 0, color = C.active, points = 60, height = 36
     return Array.from({ length: points }, (_, i) =>
       0.4 + 0.4 * Math.sin(i / 4 + seed) + (r(i) - 0.5) * 0.25,
     );
-  }, [seed, points]);
+  }, [seed, points, rawData]);
 
   const min = Math.min(...data);
   const max = Math.max(...data);

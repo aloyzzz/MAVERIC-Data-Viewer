@@ -1,6 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
 import type { AppSchema, Row } from '../types';
 
+export interface ParameterRow {
+  pass_id: number;
+  ts_ms: number;
+  ts_iso: string;
+  name: string;
+  value: string;
+  unit: string;
+}
+
 export function useSchema(refreshKey = 0) {
   const [schema, setSchema] = useState<AppSchema | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,6 +84,36 @@ export function useTableRows(tableId: string | null, limit: number) {
       })
       .catch(() => setLoading(false));
   }, [tableId, limit]);
+
+  return { rows, loading };
+}
+
+let _paramCache: ParameterRow[] | null = null;
+let _paramLoading = false;
+const _paramListeners = new Set<() => void>();
+
+export function useAllParameters() {
+  const [rows, setRows] = useState<ParameterRow[]>(_paramCache ?? []);
+  const [loading, setLoading] = useState(!_paramCache);
+
+  useEffect(() => {
+    if (_paramCache) { setRows(_paramCache); setLoading(false); return; }
+    const notify = () => { setRows(_paramCache!); setLoading(false); };
+    _paramListeners.add(notify);
+    if (!_paramLoading) {
+      _paramLoading = true;
+      fetch('/api/params')
+        .then((r) => r.json() as Promise<ParameterRow[]>)
+        .then((data) => {
+          _paramCache = data;
+          _paramListeners.forEach((fn) => fn());
+          _paramListeners.clear();
+          _paramLoading = false;
+        })
+        .catch(() => { _paramLoading = false; _paramListeners.clear(); });
+    }
+    return () => { _paramListeners.delete(notify); };
+  }, []);
 
   return { rows, loading };
 }

@@ -15,10 +15,12 @@ import { ColumnFilterPanel } from '../components/ColumnFilterPanel';
 import { DecodedFramesTab, TelemetryTab, FilesTab } from '../components/DecodedFramesTab';
 import { HistoryTab } from '../components/LiveTab';
 import { BeaconEntryTab } from '../components/BeaconEntryTab';
+import { ParameterView } from '../components/ParameterView';
 
 const NAV_TABS = [
   { id: '__dashboard__', label: 'Dashboard' },
   { id: '__db__', label: 'Database' },
+  { id: '__params__', label: 'Parameters' },
   { id: '__live__', label: 'History' },
   { id: '__ingest__', label: 'Ingest' },
 ];
@@ -126,8 +128,13 @@ export function VariationA({ schema, onSchemaRefresh }: VariationAProps) {
       {/* Dashboard tab */}
       {navTab === '__dashboard__' && <Dashboard schema={schema} onNavigate={(tab) => setNavTab(tab)} />}
 
-      {/* History tab */}
-      {navTab === '__live__' && <HistoryTab />}
+      {/* Parameters tab */}
+      {navTab === '__params__' && <ParameterView />}
+
+      {/* History tab — always mounted so pass selections and chart layouts survive tab switches */}
+      <div style={{ display: navTab === '__live__' ? 'flex' : 'none', flex: 1, minHeight: 0, flexDirection: 'column' }}>
+        <HistoryTab />
+      </div>
 
       {/* Ingest tab (file import + beacon entry) */}
       {navTab === '__ingest__' && (
@@ -167,7 +174,7 @@ export function VariationA({ schema, onSchemaRefresh }: VariationAProps) {
       )}
 
       {/* 3-pane area */}
-      {navTab !== '__dashboard__' && navTab !== '__ingest__' && navTab !== '__live__' && (
+      {navTab !== '__dashboard__' && navTab !== '__ingest__' && navTab !== '__live__' && navTab !== '__params__' && (
         <div style={{ display: 'flex', flex: 1, minHeight: 0, padding: 12 }}>
           <div style={{
             display: 'flex', flex: 1, minHeight: 0,
