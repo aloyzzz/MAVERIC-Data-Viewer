@@ -1,10 +1,10 @@
 # MAVERIC GSS — Database Viewer
 
-A web-based telemetry and mission archive browser for the MAVERIC ground station database. Queries a local SQLite file directly via a Node.js API server, with a React frontend that mirrors the existing console design language.
+A web-based telemetry and mission archive browser for the MAVERIC ground station. Ingests `.jsonl` pass files, stores them in PostgreSQL, and serves a React frontend for browsing, filtering, and exporting data.
 
 ---
 
-## Quick start
+## Quick start (development)
 
 ```bash
 npm install
@@ -16,22 +16,77 @@ Opens on `http://localhost:5173`. Both servers start together:
 | Process | Port | Role |
 |---------|------|------|
 | Vite dev server | 5173 | Serves the React frontend |
-| Express API server | 3001 | Queries `ground_station.db` |
+| Express API server | 5051 | Queries PostgreSQL |
 
-Vite proxies all `/api` requests to the Express server, so the frontend only ever talks to one origin.
+Vite proxies all `/api` requests to the Express server, so the frontend only ever talks to one origin during development.
+
+---
+
+## Deployment
+
+The app is split across two hosts:
+
+| Host | Port | Role |
+|------|------|------|
+| `mavericdata.isi.edu` | 5051 | Data server — Express API + PostgreSQL |
+| `mavericweb.isi.edu` | 5052 | Web server — static frontend + `/api` proxy |
+
+### 1. Configure environment
+
+Copy `.env.example` to `.env` on each host and fill in the values.
+
+**Data server `.env`:**
+```
+PORT=5051
+PG_HOST=localhost
+PG_PORT=5432
+PG_DATABASE=maveric_gs
+PG_USER=maveric
+PG_PASSWORD=<password>
+```
+
+**Web server `.env`:**
+```
+PORT=5052
+DATA_SERVER_URL=http://mavericdata.isi.edu:5051
+```
+
+### 2. Build the frontend (run once, or after any source change)
+
+```bash
+npm install
+npm run build
+```
+
+This produces `dist/` which the web server serves as static files.
+
+### 3. Start the data server (mavericdata.isi.edu)
+
+```bash
+npm run start
+```
+
+### 4. Start the web server (mavericweb.isi.edu)
+
+```bash
+npm run start:web
+```
+
+The web server serves `dist/` and transparently proxies all `/api/*` browser requests to the data server, so no frontend code changes are needed between environments.
 
 ---
 
 ## Architecture
 
 ```
-ground_station.db  (SQLite, 880 KB, readonly)
+PostgreSQL (mavericdata.isi.edu)
         │
         ▼
 server/
-  db.ts        Opens the DB, infers column types, serves rows
-  routes.ts    GET /api/schema · GET /api/tables/:tableId
-  index.ts     Express app on :3001
+  db.ts        Connection pool, schema loader, row fetcher, ingestion
+  routes.ts    /api/* handlers
+  index.ts     Express API server — listens on $PORT (default 5051)
+  web.ts       Static file server + /api proxy — listens on $PORT (default 5052)
         │
         │  JSON over HTTP
         ▼
@@ -52,7 +107,7 @@ src/
 
 ### `GET /api/schema`
 
-Returns the full database schema in one shot — table metadata and column definitions for every table. This is fetched once on load and cached client-side.
+Returns the full database schema — table metadata and column definitions for every table. Fetched once on load and cached client-side.
 
 ```jsonc
 {
@@ -64,24 +119,22 @@ Returns the full database schema in one shot — table metadata and column defin
       ]
     },
     {
-      "name": "events",
-      "tables": [ /* event_rx_packet, event_tx_command, event_parameter, … */ ]
+      "name": "passes",
+      "tables": [ /* pass_1, pass_2, … */ ]
     }
   ],
   "columns": {
     "passes": [
       { "id": "pass_id", "type": "int", "width": 70, "align": "right", "pk": 1, "fk": null },
       { "id": "session_id", "type": "text", "width": 280, "align": "left", "pk": null, "fk": null }
-      // …
     ]
-    // one entry per table
   }
 }
 ```
 
 ### `GET /api/tables/:tableId`
 
-Returns rows for a table. Accepts optional query parameters:
+Returns rows for a table.
 
 | Param | Default | Description |
 |-------|---------|-------------|
@@ -90,53 +143,50 @@ Returns rows for a table. Accepts optional query parameters:
 | `sort` | — | Column name to sort by |
 | `dir` | `asc` | Sort direction: `asc` or `desc` |
 
-Rows are plain objects matching the SQLite column names. No transformation is applied server-side — types come back as SQLite stores them (integers as numbers, TEXT as strings).
+### `GET /api/tables/:tableId/frames`
+
+Returns only `rx_packet` and `tx_command` events with non-null `inner_hex`, used by the decoded frames tab.
+
+### `POST /api/ingest`
+
+Accepts a `.jsonl` file upload (multipart `file` field). Parses every event, writes to a new `pass_N` table in PostgreSQL, decodes binary telemetry into `decoded_telemetry`, and returns an ingest summary.
+
+### `DELETE /api/passes/:passId`
+
+Drops the `pass_N` table and removes the pass record.
 
 ---
 
 ## Database schema
 
-The SQLite file contains 7 tables from a single MAVERIC ground station pass (April 29 2026, ~57 minutes, operator: irfan, station: GS-1).
+Passes are stored in PostgreSQL. Each ingested `.jsonl` file creates one row in `passes` and a dedicated `pass_N` table containing all its events.
 
-| Table | Rows | Description |
-|-------|------|-------------|
-| `passes` | 1 | Top-level session record |
-| `event_rx_packet` | 220 | Decoded downlink packets (ASM+GOLAY / AX.25) |
-| `event_tx_command` | 46 | Uplink commands sent |
-| `event_parameter` | 3,798 | Telemetry parameters extracted from RX packets |
-| `event_alarm` | 138 | Alarms raised and cleared during the pass |
-| `event_cmd_verifier` | 145 | TX command verification outcomes |
-| `event_radio` | 3 | GNU Radio process lifecycle events |
+| Table | Description |
+|-------|-------------|
+| `passes` | Top-level session records — one row per ingested file |
+| `pass_N` | All events for pass N (rx_packet, tx_command, parameter, alarm, cmd_verifier, radio) |
+| `decoded_telemetry` | Binary TLM/RES fields decoded from `inner_hex`, keyed by `pass_id` + `cmd_id` |
 
 ### Key relationships
 
 ```
-passes ──────────────────┬─── event_rx_packet   (pass_id FK)
-                         ├─── event_tx_command  (pass_id FK)
-                         ├─── event_parameter   (pass_id FK)
-                         ├─── event_alarm       (pass_id FK)
-                         ├─── event_cmd_verifier(pass_id FK)
-                         └─── event_radio       (pass_id FK)
-
-event_rx_packet ─────────── event_parameter     (rx_event_id FK)
-event_tx_command ────────── event_cmd_verifier  (cmd_event_id FK)
+passes ──── pass_N             (one table per pass)
+passes ──── decoded_telemetry  (pass_id FK)
 ```
 
 ### Column type inference
 
-`server/db.ts` reads the raw SQLite schema with `PRAGMA table_info` and maps each column to one of seven render types used by the frontend:
+`server/db.ts` maps each PostgreSQL column to one of seven render types used by the frontend:
 
 | Render type | How it's detected | How it renders |
 |-------------|-------------------|----------------|
-| `int` | SQLite `INTEGER`, or name ends in `_ms` / `_len` | Right-aligned, locale-formatted number |
-| `float` | SQLite `REAL` | 4 decimal places (2 if > 100) |
+| `int` | PostgreSQL `INTEGER`/`BIGINT`, or name ends in `_ms` / `_len` | Right-aligned, locale-formatted number |
+| `float` | PostgreSQL `NUMERIC`/`REAL` | 4 decimal places (2 if > 100) |
 | `time` | Name is `ts_iso`, ends in `_iso`, or is `pass_date` / `pass_time` | Dimmed monospace text |
-| `tag` | Name is `alarm_severity`, `outcome`, `stage`, `radio_action`, etc. | Coloured badge (severity-aware) |
-| `frame` | Name is `frame_type` or `frame_label` | Coloured by protocol (AX.25 = blue, GOLAY = teal) |
+| `tag` | Name is `event_kind`, `alarm_severity`, `outcome`, `stage`, etc. | Coloured badge (severity-aware) |
+| `frame` | Name is `frame_type` or `frame_label` | Coloured by protocol |
 | `bool` | Name matches `duplicate`, `uplink_echo`, `*_ok`, `*_plausible`, etc. | Green `true` / red `false` badge |
 | `text` | Everything else | Plain monospace |
-
-FK annotations are inferred by column name: `pass_id → passes`, `rx_event_id → event_rx_packet`, `cmd_event_id → event_tx_command`.
 
 ---
 
@@ -153,14 +203,10 @@ applyFilter(rows, query)   client-side; supports plain text and operators
 applySort(rows, sort)      client-side; numeric or lexicographic
         │
         ▼
-DataTable → rows rendered as virtualised-style fixed-height divs
+DataTable → rows rendered as fixed-height divs
 ```
 
-Table rows are fetched once per table and cached in a `useRef` Map for the lifetime of the page — switching between tables is instant after the first load.
-
 ### Filtering syntax
-
-The filter bar in both layouts accepts a freeform query string:
 
 | Syntax | Example | Effect |
 |--------|---------|--------|
@@ -174,20 +220,18 @@ The filter bar in both layouts accepts a freeform query string:
 
 ### Layouts
 
-Two layout variants are available, toggled with the **A / B** buttons in the header:
-
 **Layout A — Sidebar + Grid + Right detail**
 - Collapsible schema sidebar on the left (240 px)
 - Scrollable data grid fills the centre
 - Row inspector slides in from the right (360 px) when a row is selected
 
 **Layout B — Tab strip + Grid + Bottom detail**
-- Open tables are tracked as closeable tabs across the top
+- Open tables tracked as closeable tabs across the top
 - New tables opened from the `▦ tables` dropdown or `+` button
 - Info strip below the tabs shows live row count, ingest rate, and sparkline
 - Row inspector opens at the bottom (240 px)
 
-Both layouts share the same keyboard shortcuts:
+Keyboard shortcuts (both layouts):
 
 | Key | Action |
 |-----|--------|
@@ -198,7 +242,7 @@ Both layouts share the same keyboard shortcuts:
 
 ### Design tokens
 
-All colours are defined in `src/lib/colors.ts` as a single `const C` object. The palette is pure-black surfaces with five semantic accent colours:
+All colours are defined in `src/lib/colors.ts` as a single `const C` object:
 
 | Token | Hex | Used for |
 |-------|-----|---------|
@@ -213,16 +257,18 @@ All colours are defined in `src/lib/colors.ts` as a single `const C` object. The
 ## Project structure
 
 ```
-ground_station.db          Source of truth — never written to
+.env.example               Environment variable reference
 package.json               Single package for both server and client
-vite.config.ts             Vite with /api proxy to :3001
+vite.config.ts             Vite with /api proxy to data server
 tsconfig.json              Shared TS config (bundler module resolution)
 index.html                 Vite entry point
 
 server/
-  index.ts                 Express app, binds :3001
-  db.ts                    SQLite connection, schema loader, row fetcher
-  routes.ts                /api/schema and /api/tables/:tableId handlers
+  index.ts                 Express API server — $PORT (default 5051)
+  web.ts                   Web server: static files + /api proxy — $PORT (default 5052)
+  db.ts                    PostgreSQL pool, schema loader, ingestion, telemetry decode
+  routes.ts                /api/* route handlers
+  telemetryDecode.ts       Binary frame decoder
 
 src/
   main.tsx                 React root
@@ -232,7 +278,7 @@ src/
     colors.ts              Design tokens and tone helpers
     dataUtils.ts           applyFilter, applySort, exportCsv
   hooks/
-    useApi.ts              useSchema, useTableRows
+    useApi.ts              useSchema, useTableRows, useFramePackets
   components/
     Cell.tsx               Value renderer + HeaderCell (sort indicator)
     DataTable.tsx          Scrollable grid with sticky header
@@ -243,6 +289,10 @@ src/
     MiniHeader.tsx         App bar with brand, operator info, layout toggle
     HintBar.tsx            Keyboard shortcut hint strip at the bottom
     CommandPalette.tsx     Ctrl+K modal for jumping between tables
+    IngestPage.tsx         File upload and ingest status UI
+    DecodedFramesTab.tsx   Binary telemetry browser
+    LiveTab.tsx            Real-time event stream
+    CsvExportTab.tsx       Batch CSV export
   layouts/
     VariationA.tsx         Sidebar + Grid + Right detail
     VariationB.tsx         Tab strip + Grid + Bottom detail
@@ -254,7 +304,9 @@ src/
 
 | Command | Description |
 |---------|-------------|
-| `npm run dev` | Start both Vite (:5173) and Express (:3001) concurrently |
+| `npm run dev` | Start both Vite (:5173) and Express API (:5051) concurrently |
 | `npm run build` | Production build to `dist/` |
-| `npm run preview` | Serve the production build locally |
-| `npm run server` | Start only the Express API server |
+| `npm run start` | Start the data server (production, uses `$PORT`) |
+| `npm run start:web` | Start the web server (production, uses `$PORT` and `$DATA_SERVER_URL`) |
+| `npm run server` | Start only the Express API server via tsx |
+| `npm run preview` | Serve the production build locally via Vite |
