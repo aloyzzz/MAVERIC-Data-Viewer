@@ -1,8 +1,15 @@
-import { Pool, type PoolClient } from 'pg';
+import { Pool, types, type PoolClient } from 'pg';
 import { mkdirSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { resolve, join } from 'path';
 import type { ColumnDef, ColumnType, AppSchema, TableMeta } from '../src/types.js';
 import { decodeRow, parseInnerHex } from './telemetryDecode.js';
+
+// node-postgres returns BIGINT (int8, OID 20) as a string by default to avoid
+// precision loss. Every BIGINT column here holds an epoch-millisecond timestamp,
+// a duration, or a small counter -- all well within Number.MAX_SAFE_INTEGER --
+// and the frontend treats them as numbers (e.g. `new Date(ts_ms)`, which throws
+// on a string). Parse int8 to a JS number so that contract holds.
+types.setTypeParser(20, (val) => parseInt(val, 10));
 
 // ── Connection pool ───────────────────────────────────────────────────────────
 
@@ -308,6 +315,7 @@ export async function loadSchema(): Promise<AppSchema> {
       let label: string;
       let desc: string;
       let primary: string;
+      let sourceFile: string | undefined;
 
       if (name === 'passes') {
         schemaGroup = 'mission';
@@ -323,6 +331,7 @@ export async function loadSchema(): Promise<AppSchema> {
           ? `${meta.pass_date} ${meta.pass_time} · mission: ${meta.mission_id} · operator: ${meta.operator}`
           : '';
         primary = 'id';
+        sourceFile = meta?.source_file || undefined;
       } else {
         schemaGroup = 'misc';
         label = name;
@@ -345,7 +354,7 @@ export async function loadSchema(): Promise<AppSchema> {
       });
 
       if (!groups[schemaGroup]) groups[schemaGroup] = [];
-      groups[schemaGroup].push({ id: name, label, desc, primary, rows: cnt });
+      groups[schemaGroup].push({ id: name, label, desc, primary, rows: cnt, sourceFile });
     }
 
     const order = ['mission', 'passes', 'misc'];

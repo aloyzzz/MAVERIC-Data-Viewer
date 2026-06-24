@@ -20,16 +20,15 @@ const NAV_TABS = [
   { id: '__dashboard__', label: 'Dashboard' },
   { id: '__db__', label: 'Database' },
   { id: '__live__', label: 'History' },
-  { id: '__beacon__', label: 'Beacon Entry' },
-  { id: '__export__', label: '↓ Export CSV' },
-  { id: '__ingest__', label: '↑ Ingest' },
+  { id: '__ingest__', label: 'Ingest' },
 ];
 
 interface VariationAProps {
   schema: AppSchema;
+  onSchemaRefresh?: () => void;
 }
 
-export function VariationA({ schema }: VariationAProps) {
+export function VariationA({ schema, onSchemaRefresh }: VariationAProps) {
   const allTables = schema.schemas.flatMap((s) => s.tables);
 
   const [navTab, setNavTab] = useState('__dashboard__');
@@ -44,9 +43,10 @@ export function VariationA({ schema }: VariationAProps) {
   const [sort, setSort] = useState<SortState>({ col: 'ts_ms', dir: 'desc' });
   const [sidebarFilter, setSidebarFilter] = useState('');
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [dbSubTab, setDbSubTab] = useState<'data' | 'columns' | 'frames' | 'telemetry' | 'files'>('data');
+  const [dbSubTab, setDbSubTab] = useState<'data' | 'columns' | 'frames' | 'telemetry' | 'files' | 'export'>('data');
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [limit, setLimit] = useState(1000);
+  const [ingestSubTab, setIngestSubTab] = useState<'file' | 'beacon'>('file');
 
   const { rows: allRows, loading } = useTableRows(activeId, limit);
 
@@ -100,9 +100,7 @@ export function VariationA({ schema }: VariationAProps) {
       }}>
         {NAV_TABS.map((t) => {
           const active = t.id === navTab;
-          const isExport  = t.id === '__export__';
-          const isIngest  = t.id === '__ingest__';
-          const isSpecial = isExport || isIngest;
+          const isIngest = t.id === '__ingest__';
           return (
             <div
               key={t.id}
@@ -110,15 +108,13 @@ export function VariationA({ schema }: VariationAProps) {
               style={{
                 padding: '4px 10px', fontSize: 11.5,
                 color: active
-                  ? (isIngest ? C.info : isExport ? C.active : C.textPrimary)
+                  ? (isIngest ? C.info : C.textPrimary)
                   : C.textMuted,
                 backgroundColor: active ? C.bgPanelRaised : 'transparent',
                 border: active ? `1px solid ${C.borderSubtle}` : '1px solid transparent',
                 borderBottom: active ? `1px solid ${C.bgPanelRaised}` : '1px solid transparent',
                 borderRadius: '3px 3px 0 0',
                 cursor: 'pointer',
-                marginLeft: isExport ? 'auto' : undefined,
-                fontFamily: isSpecial ? C.fontMono : undefined,
               }}
             >
               {t.label}
@@ -133,17 +129,45 @@ export function VariationA({ schema }: VariationAProps) {
       {/* History tab */}
       {navTab === '__live__' && <HistoryTab />}
 
-      {/* Beacon entry tab */}
-      {navTab === '__beacon__' && <BeaconEntryTab schema={schema} />}
-
-      {/* Export tab */}
-      {navTab === '__export__' && <CsvExportTab schema={schema} />}
-
-      {/* Ingest tab */}
-      {navTab === '__ingest__' && <IngestPage />}
+      {/* Ingest tab (file import + beacon entry) */}
+      {navTab === '__ingest__' && (
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+          <div style={{
+            display: 'flex', alignItems: 'center',
+            height: 28, padding: '0 10px',
+            borderBottom: `1px solid ${C.borderSubtle}`,
+            backgroundColor: C.bgApp,
+            gap: 2, flexShrink: 0,
+          }}>
+            {(['file', 'beacon'] as const).map((sub) => {
+              const active = ingestSubTab === sub;
+              return (
+                <div
+                  key={sub}
+                  onClick={() => setIngestSubTab(sub)}
+                  style={{
+                    padding: '3px 10px', fontSize: 11,
+                    fontFamily: C.fontMono,
+                    color: active ? C.textPrimary : C.textMuted,
+                    backgroundColor: active ? C.bgPanelRaised : 'transparent',
+                    border: active ? `1px solid ${C.borderSubtle}` : '1px solid transparent',
+                    borderBottom: active ? `1px solid ${C.bgPanelRaised}` : '1px solid transparent',
+                    borderRadius: '3px 3px 0 0',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {sub === 'file' ? 'File Import' : 'Beacon Entry'}
+                </div>
+              );
+            })}
+          </div>
+          {ingestSubTab === 'file' && <IngestPage onIngestComplete={onSchemaRefresh} />}
+          {ingestSubTab === 'beacon' && <BeaconEntryTab schema={schema} />}
+        </div>
+      )}
 
       {/* 3-pane area */}
-      {navTab !== '__export__' && navTab !== '__dashboard__' && navTab !== '__ingest__' && navTab !== '__live__' && navTab !== '__beacon__' && (
+      {navTab !== '__dashboard__' && navTab !== '__ingest__' && navTab !== '__live__' && (
         <div style={{ display: 'flex', flex: 1, minHeight: 0, padding: 12 }}>
           <div style={{
             display: 'flex', flex: 1, minHeight: 0,
@@ -196,7 +220,7 @@ export function VariationA({ schema }: VariationAProps) {
                 backgroundColor: C.bgApp,
                 gap: 2, flexShrink: 0,
               }}>
-                {(['data', 'frames', 'files', 'telemetry', 'columns'] as const).map((tab) => {
+                {(['data', 'frames', 'files', 'telemetry', 'export', 'columns'] as const).map((tab) => {
                   const active = dbSubTab === tab;
                   return (
                     <div
@@ -244,9 +268,12 @@ export function VariationA({ schema }: VariationAProps) {
               )}
 
               {dbSubTab === 'telemetry' && (
-                <TelemetryTab tableId={activeId} />
+                <TelemetryTab tableId={activeId} sourceFile={table?.sourceFile} />
               )}
 
+              {dbSubTab === 'export' && (
+                <CsvExportTab schema={schema} embedded />
+              )}
 
               {dbSubTab === 'data' && table && (
                 <FilterBar
@@ -276,8 +303,8 @@ export function VariationA({ schema }: VariationAProps) {
                 />
               )}
 
-              {/* Status bar — hidden on frames/files/telemetry/columns tabs */}
-              {dbSubTab !== 'frames' && dbSubTab !== 'files' && dbSubTab !== 'telemetry' && dbSubTab !== 'columns' && (
+              {/* Status bar — hidden on frames/files/telemetry/export/columns tabs */}
+              {dbSubTab !== 'frames' && dbSubTab !== 'files' && dbSubTab !== 'telemetry' && dbSubTab !== 'export' && dbSubTab !== 'columns' && (
                 <div style={{
                   padding: '4px 12px',
                   borderTop: `1px solid ${C.borderSubtle}`,

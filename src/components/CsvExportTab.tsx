@@ -94,9 +94,10 @@ function StatPill({
 
 interface CsvExportTabProps {
   schema: AppSchema;
+  embedded?: boolean;
 }
 
-export function CsvExportTab({ schema }: CsvExportTabProps) {
+export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
   const allTables = schema.schemas.flatMap((s) => s.tables);
 
   /* table selection — default to first pass event table */
@@ -231,11 +232,11 @@ export function CsvExportTab({ schema }: CsvExportTabProps) {
 
   /* ── render ──────────────────────────────────────────────────────────────*/
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: 12 }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: embedded ? 0 : 12 }}>
       <div style={{
         flex: 1, display: 'flex', minHeight: 0,
-        border: `1px solid ${C.borderSubtle}`,
-        borderRadius: 4, overflow: 'hidden',
+        border: embedded ? 'none' : `1px solid ${C.borderSubtle}`,
+        borderRadius: embedded ? 0 : 4, overflow: 'hidden',
         backgroundColor: C.bgPanel,
       }}>
 

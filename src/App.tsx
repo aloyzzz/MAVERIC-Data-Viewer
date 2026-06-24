@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { C } from './lib/colors';
 import { useSchema } from './hooks/useApi';
 import { MiniHeader } from './components/MiniHeader';
@@ -5,7 +6,9 @@ import { HintBar } from './components/HintBar';
 import { VariationA } from './layouts/VariationA';
 
 export function App() {
-  const { schema, error } = useSchema();
+  const [refreshKey, setRefreshKey] = useState(0);
+  const { schema, error } = useSchema(refreshKey);
+  const refreshSchema = () => setRefreshKey((k) => k + 1);
 
   if (error) {
     return (
@@ -48,7 +51,7 @@ export function App() {
       position: 'relative',
     }}>
       <MiniHeader />
-      <VariationA schema={schema} />
+      <VariationA schema={schema} onSchemaRefresh={refreshSchema} />
       <HintBar />
     </div>
   );
