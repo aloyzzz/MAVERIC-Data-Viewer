@@ -8,8 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "server": "tsx server/index.ts",
-    "start": "node --import tsx/esm server/index.ts",
-    "start:web": "node --import tsx/esm server/web.ts"
+    "start": "tsx server/index.ts",
+    "start:web": "tsx server/web.ts"
   },
   "dependencies": {
     "@types/multer": "^2.1.0",
