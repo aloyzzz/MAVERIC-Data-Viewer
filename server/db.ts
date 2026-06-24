@@ -130,7 +130,8 @@ function passTableDDL(tableName: string): string {
       radio_cwd       TEXT,
       radio_detail    TEXT,
       radio_expected  TEXT
-    )
+    );
+    CREATE INDEX IF NOT EXISTS "idx_${tableName}_ts_ms" ON "${tableName}" (ts_ms);
   `;
 }
 
@@ -222,13 +223,18 @@ export async function initDb(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_dt_pass_cmd ON decoded_telemetry (pass_id, cmd_id);
     `);
 
-    // Backfill any passes that have no decoded rows yet.
+    // Backfill any passes that have no decoded rows yet, and ensure each
+    // per-pass table has a ts_ms index (the default sort column).
     const allPasses = (await client.query('SELECT pass_id FROM passes')).rows as { pass_id: number }[];
     const decodedRes = await client.query('SELECT DISTINCT pass_id FROM decoded_telemetry');
     const decodedSet = new Set((decodedRes.rows as { pass_id: number }[]).map(r => r.pass_id));
     for (const { pass_id } of allPasses) {
-      if (!decodedSet.has(pass_id) && await tableExists(client, `pass_${pass_id}`)) {
-        try { await materializeTelemetry(pass_id); } catch { /* skip */ }
+      const tbl = `pass_${pass_id}`;
+      if (await tableExists(client, tbl)) {
+        await client.query(`CREATE INDEX IF NOT EXISTS "idx_${tbl}_ts_ms" ON "${tbl}" (ts_ms)`);
+        if (!decodedSet.has(pass_id)) {
+          try { await materializeTelemetry(pass_id); } catch { /* skip */ }
+        }
       }
     }
   } finally {

@@ -1,3 +1,4 @@
+import { useRef, useState, useEffect, useLayoutEffect } from 'react';
 import { C } from '../lib/colors';
 import type { ColumnDef, Row, SortState } from '../types';
 import { Cell, HeaderCell } from './Cell';
@@ -13,13 +14,53 @@ interface DataTableProps {
   loading?: boolean;
 }
 
+// Fixed row height (incl. 1px border via box-sizing: border-box) used for
+// windowed virtualization — only rows near the viewport are mounted.
+const ROW_H = 24;
+const OVERSCAN = 16;
+
 export function DataTable({
   rows, columns, selected, onSelect, sort, onSort, highlightRow, loading,
 }: DataTableProps) {
   const total = columns.reduce((a, c) => a + c.width, 0) + 60;
 
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportH, setViewportH] = useState(600);
+
+  // Track viewport height (mount + resize)
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => setViewportH(el.clientHeight);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Reset scroll to top whenever the dataset changes (new table / sort / filter)
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = 0;
+    setScrollTop(0);
+  }, [rows]);
+
+  const count = rows.length;
+  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const visibleCount = Math.ceil(viewportH / ROW_H) + OVERSCAN * 2;
+  const endIdx = Math.min(count, startIdx + visibleCount);
+  const topPad = startIdx * ROW_H;
+  const bottomPad = Math.max(0, (count - endIdx) * ROW_H);
+
+  const visibleRows = rows.slice(startIdx, endIdx);
+
   return (
-    <div style={{ overflow: 'auto', flex: 1, minHeight: 0 }}>
+    <div
+      ref={scrollRef}
+      onScroll={(e) => setScrollTop((e.currentTarget as HTMLDivElement).scrollTop)}
+      style={{ overflow: 'auto', flex: 1, minHeight: 0 }}
+    >
       <div style={{ minWidth: total }}>
         {/* Sticky header — scrolls horizontally with the content, stays fixed vertically */}
         <div style={{
@@ -52,12 +93,16 @@ export function DataTable({
             loading…
           </div>
         )}
-        {!loading && rows.length === 0 && (
+        {!loading && count === 0 && (
           <div style={{ padding: 32, textAlign: 'center', color: C.textMuted, fontSize: 12, fontFamily: C.fontMono }}>
             0 rows match filter
           </div>
         )}
-        {rows.map((row) => {
+
+        {/* Top spacer keeps the scroll height correct for skipped rows */}
+        {topPad > 0 && <div style={{ height: topPad }} />}
+
+        {visibleRows.map((row) => {
           const sel = selected?.__idx === row.__idx;
           const flash = highlightRow === row.__idx;
           return (
@@ -66,7 +111,8 @@ export function DataTable({
               onClick={() => onSelect(row)}
               style={{
                 display: 'flex',
-                height: 24,
+                height: ROW_H,
+                boxSizing: 'border-box',
                 alignItems: 'center',
                 borderBottom: `1px solid ${C.borderSubtle}`,
                 borderLeft: `2px solid ${sel ? C.active : 'transparent'}`,
@@ -94,6 +140,9 @@ export function DataTable({
             </div>
           );
         })}
+
+        {/* Bottom spacer */}
+        {bottomPad > 0 && <div style={{ height: bottomPad }} />}
       </div>
     </div>
   );
