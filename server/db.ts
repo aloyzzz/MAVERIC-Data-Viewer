@@ -1,43 +1,30 @@
-import Database from 'better-sqlite3';
+import { Pool, types, type PoolClient } from 'pg';
 import { mkdirSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { resolve, join } from 'path';
 import type { ColumnDef, ColumnType, AppSchema, TableMeta } from '../src/types.js';
 import { decodeRow, parseInnerHex } from './telemetryDecode.js';
 
-const DB_PATH = resolve(process.cwd(), 'ground_station.db');
+// node-postgres returns BIGINT (int8, OID 20) as a string by default to avoid
+// precision loss. Every BIGINT column here holds an epoch-millisecond timestamp,
+// a duration, or a small counter -- all well within Number.MAX_SAFE_INTEGER --
+// and the frontend treats them as numbers (e.g. `new Date(ts_ms)`, which throws
+// on a string). Parse int8 to a JS number so that contract holds.
+types.setTypeParser(20, (val) => parseInt(val, 10));
 
-const DECODED_TELEMETRY_DDL = `
-  CREATE TABLE IF NOT EXISTS decoded_telemetry (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    pass_id INTEGER NOT NULL,
-    ts_ms   INTEGER NOT NULL,
-    cmd_id  TEXT NOT NULL,
-    field   TEXT NOT NULL,
-    value   TEXT NOT NULL,
-    unit    TEXT NOT NULL DEFAULT ''
-  );
-  CREATE INDEX IF NOT EXISTS idx_dt_pass     ON decoded_telemetry (pass_id);
-  CREATE INDEX IF NOT EXISTS idx_dt_pass_cmd ON decoded_telemetry (pass_id, cmd_id);
-`;
+// ── Connection pool ───────────────────────────────────────────────────────────
 
-const PASSES_DDL = `
-  CREATE TABLE IF NOT EXISTS passes (
-    pass_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id     TEXT,
-    source_file    TEXT,
-    pass_date      TEXT,
-    pass_time      TEXT,
-    start_ts_ms    INTEGER,
-    end_ts_ms      INTEGER,
-    mission_id     TEXT,
-    operator       TEXT,
-    station        TEXT,
-    schema_version TEXT
-  )
-`;
+const pool = new Pool({
+  host:     process.env.PG_HOST     ?? 'localhost',
+  port:     Number(process.env.PG_PORT ?? 5432),
+  database: process.env.PG_DATABASE ?? 'maveric_gs',
+  user:     process.env.PG_USER     ?? 'maveric',
+  password: process.env.PG_PASSWORD ?? 'maveric',
+});
+
+// ── Schema constants ──────────────────────────────────────────────────────────
 
 // All columns in a per-pass unified event table, in declared order.
-// id is omitted here (it is AUTOINCREMENT in the DDL, not inserted by app code).
+// id is omitted here (it is SERIAL in the DDL, not inserted by app code).
 const EVENT_COLS = [
   'event_kind', 'event_id', 'ts_ms', 'ts_iso', 'seq', 'v',
   // shared by rx_packet + tx_command
@@ -76,11 +63,11 @@ function emptyRow(): EventRow {
 
 function passTableDDL(tableName: string): string {
   return `
-    CREATE TABLE "${tableName}" (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    CREATE TABLE IF NOT EXISTS "${tableName}" (
+      id          SERIAL PRIMARY KEY,
       event_kind  TEXT NOT NULL,
       event_id    TEXT,
-      ts_ms       INTEGER,
+      ts_ms       BIGINT,
       ts_iso      TEXT,
       seq         INTEGER,
       v           TEXT,
@@ -130,8 +117,8 @@ function passTableDDL(tableName: string): string {
       alarm_prev_state         TEXT,
       alarm_prev_severity      TEXT,
       alarm_removed            TEXT,
-      alarm_first_seen_ms      INTEGER,
-      alarm_last_transition_ms INTEGER,
+      alarm_first_seen_ms      BIGINT,
+      alarm_last_transition_ms BIGINT,
       alarm_operator           TEXT,
       alarm_context_raw        TEXT,
       cmd_event_id   TEXT,
@@ -139,7 +126,7 @@ function passTableDDL(tableName: string): string {
       stage          TEXT,
       verifier_id    TEXT,
       outcome        TEXT,
-      elapsed_ms     INTEGER,
+      elapsed_ms     BIGINT,
       match_event_id TEXT,
       radio_action    TEXT,
       radio_state     TEXT,
@@ -150,25 +137,19 @@ function passTableDDL(tableName: string): string {
       radio_cwd       TEXT,
       radio_detail    TEXT,
       radio_expected  TEXT
-    )
+    );
+    CREATE INDEX IF NOT EXISTS "idx_${tableName}_ts_ms" ON "${tableName}" (ts_ms);
   `;
 }
 
-const OLD_EVENT_TABLES = [
-  'event_rx_packet',
-  'event_tx_command',
-  'event_parameter',
-  'event_alarm',
-  'event_cmd_verifier',
-  'event_radio',
-] as const;
+// ── Type inference ────────────────────────────────────────────────────────────
 
-function inferType(colName: string, sqliteType: string): ColumnType {
+function inferType(colName: string, pgType: string): ColumnType {
   const n = colName.toLowerCase();
-  const t = sqliteType.toUpperCase();
+  const t = pgType.toLowerCase();
   if (n === 'ts_iso' || n.endsWith('_iso') || n === 'pass_date' || n === 'pass_time') return 'time';
   if (n.endsWith('_ms') || n === 'value_unix_ms') return 'int';
-  if (t === 'INTEGER') return 'int';
+  if (t === 'integer' || t === 'bigint' || t === 'smallint' || t === 'numeric') return 'int';
   if (n === 'frame_type' || n === 'frame_label') return 'frame';
   if (n === 'event_kind') return 'tag';
   if (['alarm_severity', 'alarm_state', 'alarm_prev_state', 'alarm_prev_severity',
@@ -203,14 +184,72 @@ function widthFor(colName: string, type: ColumnType): number {
   return 140;
 }
 
-interface PragmaRow {
-  cid: number;
-  name: string;
-  type: string;
-  notnull: number;
-  dflt_value: unknown;
-  pk: number;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+async function tableExists(client: PoolClient, name: string): Promise<boolean> {
+  const res = await client.query(
+    `SELECT 1 FROM information_schema.tables
+     WHERE table_schema = 'public' AND table_name = $1`,
+    [name],
+  );
+  return res.rowCount !== null && res.rowCount > 0;
 }
+
+// ── Init / migration ──────────────────────────────────────────────────────────
+
+export async function initDb(): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS passes (
+        pass_id        SERIAL PRIMARY KEY,
+        session_id     TEXT,
+        source_file    TEXT,
+        pass_date      TEXT,
+        pass_time      TEXT,
+        start_ts_ms    BIGINT,
+        end_ts_ms      BIGINT,
+        mission_id     TEXT,
+        operator       TEXT,
+        station        TEXT,
+        schema_version TEXT
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS decoded_telemetry (
+        id      SERIAL PRIMARY KEY,
+        pass_id INTEGER NOT NULL,
+        ts_ms   BIGINT  NOT NULL,
+        cmd_id  TEXT    NOT NULL,
+        field   TEXT    NOT NULL,
+        value   TEXT    NOT NULL,
+        unit    TEXT    NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_dt_pass     ON decoded_telemetry (pass_id);
+      CREATE INDEX IF NOT EXISTS idx_dt_pass_cmd ON decoded_telemetry (pass_id, cmd_id);
+    `);
+
+    // Backfill any passes that have no decoded rows yet, and ensure each
+    // per-pass table has a ts_ms index (the default sort column).
+    const allPasses = (await client.query('SELECT pass_id FROM passes')).rows as { pass_id: number }[];
+    const decodedRes = await client.query('SELECT DISTINCT pass_id FROM decoded_telemetry');
+    const decodedSet = new Set((decodedRes.rows as { pass_id: number }[]).map(r => r.pass_id));
+    for (const { pass_id } of allPasses) {
+      const tbl = `pass_${pass_id}`;
+      if (await tableExists(client, tbl)) {
+        await client.query(`CREATE INDEX IF NOT EXISTS "idx_${tbl}_ts_ms" ON "${tbl}" (ts_ms)`);
+        if (!decodedSet.has(pass_id)) {
+          try { await materializeTelemetry(pass_id); } catch { /* skip */ }
+        }
+      }
+    }
+  } finally {
+    client.release();
+  }
+}
+
+// ── Schema loading ────────────────────────────────────────────────────────────
 
 interface PassRow {
   pass_id: number;
@@ -226,259 +265,116 @@ interface PassRow {
   schema_version: string;
 }
 
-let _db: Database.Database | null = null;
-let _dbWrite: Database.Database | null = null;
-
-function getDb(): Database.Database {
-  if (!_db) _db = new Database(DB_PATH, { readonly: true });
-  return _db;
-}
-
-function getWriteDb(): Database.Database {
-  if (!_dbWrite) _dbWrite = new Database(DB_PATH);
-  return _dbWrite;
-}
-
-export function resetReadDb(): void {
-  _db?.close();
-  _db = null;
-}
-
-function tableExists(db: Database.Database, name: string): boolean {
-  return !!(db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(name));
-}
-
-function migrateOldTables(db: Database.Database): void {
-  const present = OLD_EVENT_TABLES.filter((t) => tableExists(db, t));
-  if (present.length === 0) return;
-
-  const passIds = new Set<number>();
-  for (const t of present) {
-    try {
-      const rows = db.prepare(`SELECT DISTINCT pass_id FROM "${t}"`).all() as { pass_id: number }[];
-      rows.forEach((r) => passIds.add(r.pass_id));
-    } catch { /* ignore */ }
-  }
-
-  for (const passId of passIds) {
-    const tbl = `pass_${passId}`;
-    if (tableExists(db, tbl)) continue;
-    db.exec(passTableDDL(tbl));
-
-    if (present.includes('event_rx_packet')) {
-      db.prepare(`
-        INSERT INTO "${tbl}"
-          (event_kind,event_id,ts_ms,ts_iso,seq,v,
-           frame_type,transport_meta,raw_hex,size,duplicate,uplink_echo,unknown,warnings,mission_id,
-           mission_facts_header_cmd_id,mission_facts_header_src,mission_facts_header_dest,
-           mission_facts_header_echo,mission_facts_header_ptype,
-           mission_facts_protocol_args_hex,mission_facts_protocol_csp_plausible,
-           mission_facts_protocol_stripped_header,
-           mission_facts_protocol_csp_header_prio,mission_facts_protocol_csp_header_src,
-           mission_facts_protocol_csp_header_dest,mission_facts_protocol_csp_header_dport,
-           mission_facts_protocol_csp_header_sport,mission_facts_protocol_csp_header_flags,
-           mission_facts_integrity_overall_ok,mission_facts_integrity_body_crc_ok,
-           mission_facts_integrity_csp_crc32,mission_facts_integrity_csp_crc32_ok,
-           frame_label,inner_hex,inner_len,wire_hex,wire_len)
-        SELECT
-          'rx_packet',event_id,ts_ms,ts_iso,seq,v,
-          frame_type,transport_meta,raw_hex,size,duplicate,uplink_echo,unknown,warnings,mission_id,
-          mission_facts_header_cmd_id,mission_facts_header_src,mission_facts_header_dest,
-          mission_facts_header_echo,mission_facts_header_ptype,
-          mission_facts_protocol_args_hex,mission_facts_protocol_csp_plausible,
-          mission_facts_protocol_stripped_header,
-          mission_facts_protocol_csp_header_prio,mission_facts_protocol_csp_header_src,
-          mission_facts_protocol_csp_header_dest,mission_facts_protocol_csp_header_dport,
-          mission_facts_protocol_csp_header_sport,mission_facts_protocol_csp_header_flags,
-          mission_facts_integrity_overall_ok,mission_facts_integrity_body_crc_ok,
-          mission_facts_integrity_csp_crc32,mission_facts_integrity_csp_crc32_ok,
-          frame_label,inner_hex,inner_len,wire_hex,wire_len
-        FROM event_rx_packet WHERE pass_id=?
-      `).run(passId);
-    }
-
-    if (present.includes('event_tx_command')) {
-      db.prepare(`
-        INSERT INTO "${tbl}"
-          (event_kind,event_id,ts_ms,ts_iso,seq,v,
-           frame_label,inner_hex,inner_len,wire_hex,wire_len,
-           mission_facts_header_cmd_id,mission_facts_header_src,mission_facts_header_dest,
-           mission_facts_header_echo,mission_facts_header_ptype,
-           mission_facts_protocol_args_hex,
-           mission_facts_protocol_csp_header_prio,mission_facts_protocol_csp_header_src,
-           mission_facts_protocol_csp_header_dest,mission_facts_protocol_csp_header_dport,
-           mission_facts_protocol_csp_header_sport,mission_facts_protocol_csp_header_flags)
-        SELECT
-          'tx_command',event_id,ts_ms,ts_iso,seq,v,
-          frame_label,inner_hex,inner_len,wire_hex,wire_len,
-          mission_facts_header_cmd_id,mission_facts_header_src,mission_facts_header_dest,
-          mission_facts_header_echo,mission_facts_header_ptype,
-          mission_facts_protocol_args_hex,
-          mission_facts_protocol_csp_header_prio,mission_facts_protocol_csp_header_src,
-          mission_facts_protocol_csp_header_dest,mission_facts_protocol_csp_header_dport,
-          mission_facts_protocol_csp_header_sport,mission_facts_protocol_csp_header_flags
-        FROM event_tx_command WHERE pass_id=?
-      `).run(passId);
-    }
-
-    if (present.includes('event_parameter')) {
-      db.prepare(`
-        INSERT INTO "${tbl}"
-          (event_kind,event_id,ts_ms,ts_iso,seq,v,rx_event_id,name,value,unit,display_only)
-        SELECT
-          'parameter',event_id,ts_ms,ts_iso,seq,v,rx_event_id,name,value,unit,display_only
-        FROM event_parameter WHERE pass_id=?
-      `).run(passId);
-    }
-
-    if (present.includes('event_alarm')) {
-      db.prepare(`
-        INSERT INTO "${tbl}"
-          (event_kind,event_id,ts_ms,ts_iso,seq,v,
-           alarm_id,alarm_source,alarm_label,alarm_detail,
-           alarm_severity,alarm_state,alarm_prev_state,alarm_prev_severity,
-           alarm_removed,alarm_first_seen_ms,alarm_last_transition_ms,alarm_operator,alarm_context_raw)
-        SELECT
-          'alarm',event_id,ts_ms,ts_iso,seq,v,
-          alarm_id,alarm_source,alarm_label,alarm_detail,
-          alarm_severity,alarm_state,alarm_prev_state,alarm_prev_severity,
-          alarm_removed,alarm_first_seen_ms,alarm_last_transition_ms,alarm_operator,alarm_context_raw
-        FROM event_alarm WHERE pass_id=?
-      `).run(passId);
-    }
-
-    if (present.includes('event_cmd_verifier')) {
-      db.prepare(`
-        INSERT INTO "${tbl}"
-          (event_kind,event_id,ts_ms,ts_iso,seq,v,
-           cmd_event_id,instance_id,stage,verifier_id,outcome,elapsed_ms,match_event_id)
-        SELECT
-          'cmd_verifier',event_id,ts_ms,ts_iso,seq,v,
-          cmd_event_id,instance_id,stage,verifier_id,outcome,elapsed_ms,match_event_id
-        FROM event_cmd_verifier WHERE pass_id=?
-      `).run(passId);
-    }
-
-    if (present.includes('event_radio')) {
-      db.prepare(`
-        INSERT INTO "${tbl}"
-          (event_kind,event_id,ts_ms,ts_iso,seq,v,
-           radio_action,radio_state,radio_pid,radio_exit_code,
-           radio_command,radio_script,radio_cwd,radio_detail,radio_expected)
-        SELECT
-          'radio',event_id,ts_ms,ts_iso,seq,v,
-          radio_action,radio_state,radio_pid,radio_exit_code,
-          radio_command,radio_script,radio_cwd,radio_detail,radio_expected
-        FROM event_radio WHERE pass_id=?
-      `).run(passId);
-    }
-  }
-
-  for (const t of present) {
-    db.exec(`DROP TABLE IF EXISTS "${t}"`);
-  }
-}
-
-export function initDb(): void {
-  const db = getWriteDb();
-  db.exec(PASSES_DDL);
-  db.exec(DECODED_TELEMETRY_DDL);
-  migrateOldTables(db);
-
-  // Backfill any passes that have no decoded rows yet.
-  if (tableExists(db, 'passes')) {
-    const allPasses = db.prepare('SELECT pass_id FROM passes').all() as { pass_id: number }[];
-    const decoded   = db.prepare('SELECT DISTINCT pass_id FROM decoded_telemetry').all() as { pass_id: number }[];
-    const decodedSet = new Set(decoded.map(r => r.pass_id));
-    for (const { pass_id } of allPasses) {
-      if (!decodedSet.has(pass_id) && tableExists(db, `pass_${pass_id}`)) {
-        try { materializeTelemetry(pass_id); } catch { /* skip if decode fails */ }
-      }
-    }
-  }
-
-  resetReadDb();
-}
-
-export function loadSchema(): AppSchema {
-  const db = getDb();
-
-  const passMetaMap = new Map<number, PassRow>();
+export async function loadSchema(): Promise<AppSchema> {
+  const client = await pool.connect();
   try {
-    const passes = db.prepare('SELECT * FROM passes').all() as PassRow[];
-    for (const p of passes) passMetaMap.set(p.pass_id, p);
-  } catch { /* passes table may not exist yet */ }
+    const passMetaMap = new Map<number, PassRow>();
+    try {
+      const res = await client.query('SELECT * FROM passes');
+      for (const p of res.rows as PassRow[]) passMetaMap.set(p.pass_id, p);
+    } catch { /* passes table may not exist yet */ }
 
-  const allTables = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-    .all() as { name: string }[];
+    // List all user tables in public schema
+    const tablesRes = await client.query(`
+      SELECT table_name AS name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'
+      ORDER BY table_name
+    `);
 
-  const groups: Record<string, TableMeta[]> = {};
-  const columns: Record<string, ColumnDef[]> = {};
+    const groups: Record<string, TableMeta[]> = {};
+    const columns: Record<string, ColumnDef[]> = {};
 
-  for (const { name } of allTables) {
-    const pragma = db.prepare(`PRAGMA table_info("${name}")`).all() as PragmaRow[];
-    const { cnt } = db.prepare(`SELECT COUNT(*) as cnt FROM "${name}"`).get() as { cnt: number };
+    for (const { name } of tablesRes.rows as { name: string }[]) {
+      // Column info from information_schema
+      const colRes = await client.query(`
+        SELECT column_name AS name,
+               data_type   AS type,
+               ordinal_position,
+               CASE WHEN column_name = (
+                 SELECT kcu.column_name
+                 FROM information_schema.table_constraints tc
+                 JOIN information_schema.key_column_usage kcu
+                   ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema    = kcu.table_schema
+                 WHERE tc.constraint_type = 'PRIMARY KEY'
+                   AND tc.table_schema    = 'public'
+                   AND tc.table_name      = $1
+                 LIMIT 1
+               ) THEN 1 ELSE NULL END AS pk
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = $1
+        ORDER BY ordinal_position
+      `, [name]);
 
-    let schemaGroup: string;
-    let label: string;
-    let desc: string;
-    let primary: string;
+      const cntRes = await client.query(`SELECT COUNT(*) AS cnt FROM "${name}"`);
+      const cnt = Number(cntRes.rows[0].cnt);
 
-    if (name === 'passes') {
-      schemaGroup = 'mission';
-      label = 'passes';
-      desc = 'Operator log sessions / passes';
-      primary = 'pass_id';
-    } else if (/^pass_\d+$/.test(name)) {
-      const passId = parseInt(name.slice(5), 10);
-      const meta = passMetaMap.get(passId);
-      schemaGroup = 'passes';
-      label = meta ? `${meta.session_id} (${meta.station})` : name;
-      desc = meta
-        ? `${meta.pass_date} ${meta.pass_time} · mission: ${meta.mission_id} · operator: ${meta.operator}`
-        : '';
-      primary = 'id';
-    } else {
-      schemaGroup = 'misc';
-      label = name;
-      desc = '';
-      primary = 'id';
+      let schemaGroup: string;
+      let label: string;
+      let desc: string;
+      let primary: string;
+      let sourceFile: string | undefined;
+
+      if (name === 'passes') {
+        schemaGroup = 'mission';
+        label = 'passes';
+        desc = 'Operator log sessions / passes';
+        primary = 'pass_id';
+      } else if (/^pass_\d+$/.test(name)) {
+        const passId = parseInt(name.slice(5), 10);
+        const meta = passMetaMap.get(passId);
+        schemaGroup = 'passes';
+        label = meta ? `${meta.session_id} (${meta.station})` : name;
+        desc = meta
+          ? `${meta.pass_date} ${meta.pass_time} · mission: ${meta.mission_id} · operator: ${meta.operator}`
+          : '';
+        primary = 'id';
+        sourceFile = meta?.source_file || undefined;
+      } else {
+        schemaGroup = 'misc';
+        label = name;
+        desc = '';
+        primary = 'id';
+      }
+
+      columns[name] = (colRes.rows as { name: string; type: string; pk: number | null }[]).map((c) => {
+        const type = inferType(c.name, c.type);
+        return {
+          id: c.name,
+          label: c.name,
+          type,
+          width: widthFor(c.name, type),
+          mono: true,
+          align: (type === 'int' || type === 'float') ? 'right' : 'left',
+          pk: c.pk ?? null,
+          fk: (c.name === 'pass_id' && name !== 'passes') ? 'passes' : null,
+        } satisfies ColumnDef;
+      });
+
+      if (!groups[schemaGroup]) groups[schemaGroup] = [];
+      groups[schemaGroup].push({ id: name, label, desc, primary, rows: cnt, sourceFile });
     }
 
-    columns[name] = pragma.map((c) => {
-      const type = inferType(c.name, c.type);
-      return {
-        id: c.name,
-        label: c.name,
-        type,
-        width: widthFor(c.name, type),
-        mono: true,
-        align: (type === 'int' || type === 'float') ? 'right' : 'left',
-        pk: c.pk || null,
-        fk: (c.name === 'pass_id' && name !== 'passes') ? 'passes' : null,
-      } satisfies ColumnDef;
-    });
-
-    if (!groups[schemaGroup]) groups[schemaGroup] = [];
-    groups[schemaGroup].push({ id: name, label, desc, primary, rows: cnt });
+    const order = ['mission', 'passes', 'misc'];
+    return {
+      schemas: order.filter((s) => groups[s]).map((s) => ({ name: s, tables: groups[s] })),
+      columns,
+    };
+  } finally {
+    client.release();
   }
-
-  const order = ['mission', 'passes', 'misc'];
-  return {
-    schemas: order.filter((s) => groups[s]).map((s) => ({ name: s, tables: groups[s] })),
-    columns,
-  };
 }
 
-export function fetchRows(
+// ── Fetch rows ────────────────────────────────────────────────────────────────
+
+export async function fetchRows(
   tableId: string,
   opts: { limit?: number; offset?: number; sort?: string; dir?: string } = {},
-): Record<string, unknown>[] {
-  const db = getDb();
-  const { limit = 1000, offset = 0, sort, dir } = opts;
-
+): Promise<Record<string, unknown>[]> {
   if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const { limit = 1000, offset = 0, sort, dir } = opts;
 
   let sql = `SELECT * FROM "${tableId}"`;
   if (sort && /^\w+$/.test(sort)) {
@@ -486,13 +382,12 @@ export function fetchRows(
   }
   sql += ` LIMIT ${limit} OFFSET ${offset}`;
 
-  return db.prepare(sql).all() as Record<string, unknown>[];
+  const res = await pool.query(sql);
+  return res.rows;
 }
 
-export function fetchFramePackets(tableId: string): Record<string, unknown>[] {
+export async function fetchFramePackets(tableId: string): Promise<Record<string, unknown>[]> {
   if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
-  const db = getDb();
-  // Only return the columns the frames tab needs — keeps the payload small
   const sql = `
     SELECT
       event_kind, event_id, ts_ms, ts_iso, seq,
@@ -509,10 +404,11 @@ export function fetchFramePackets(tableId: string): Record<string, unknown>[] {
       AND inner_hex IS NOT NULL
     ORDER BY ts_ms ASC
   `;
-  return db.prepare(sql).all() as Record<string, unknown>[];
+  const res = await pool.query(sql);
+  return res.rows;
 }
 
-/* ─── ingestion ──────────────────────────────────────────────────────────── */
+// ── Ingestion ─────────────────────────────────────────────────────────────────
 
 type JsonEvent = Record<string, unknown>;
 
@@ -559,9 +455,7 @@ function flatMission(m: unknown): Partial<EventRow> {
   };
 }
 
-export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: number): IngestResult {
-  const db = getWriteDb();
-
+export async function ingestJsonl(content: string, sourceFile: string, forcedPassId?: number): Promise<IngestResult> {
   const lines = content.split('\n').filter((l) => l.trim());
   const events: JsonEvent[] = [];
   let skipped = 0;
@@ -589,35 +483,39 @@ export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: 
 
   const counts: Record<string, number> = {};
 
-  const result = db.transaction(() => {
-    let passId: number;
+  const client = await pool.connect();
+  let passId: number;
+  try {
+    await client.query('BEGIN');
+
     if (forcedPassId != null) {
-      db.prepare(`
+      await client.query(`
         INSERT INTO passes
           (pass_id, session_id, source_file, pass_date, pass_time,
            start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-      `).run(forcedPassId, sessionId, sourceFile, startDate, startTime,
-             startMs, endMs, missionId, operator, station, schemaVer);
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `, [forcedPassId, sessionId, sourceFile, startDate, startTime,
+          startMs, endMs, missionId, operator, station, schemaVer]);
       passId = forcedPassId;
     } else {
-      const { lastInsertRowid } = db.prepare(`
+      const r = await client.query(`
         INSERT INTO passes
           (session_id, source_file, pass_date, pass_time,
            start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-      `).run(sessionId, sourceFile, startDate, startTime,
-             startMs, endMs, missionId, operator, station, schemaVer);
-      passId = Number(lastInsertRowid);
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        RETURNING pass_id
+      `, [sessionId, sourceFile, startDate, startTime,
+          startMs, endMs, missionId, operator, station, schemaVer]);
+      passId = Number(r.rows[0].pass_id);
     }
-    const tbl = `pass_${passId}`;
-    db.exec(passTableDDL(tbl));
 
-    // Named-parameter insert: each call passes a full row object; unset columns stay NULL.
-    const evStmt = db.prepare(`
-      INSERT INTO "${tbl}" (${EVENT_COLS.join(',')})
-      VALUES (${EVENT_COLS.map((c) => `@${c}`).join(',')})
-    `);
+    const tbl = `pass_${passId}`;
+    await client.query(passTableDDL(tbl));
+
+    // Build parameterized insert: $1..$N matching EVENT_COLS order
+    const colList = EVENT_COLS.join(', ');
+    const phList  = EVENT_COLS.map((_, i) => `$${i + 1}`).join(', ');
+    const insertSql = `INSERT INTO "${tbl}" (${colList}) VALUES (${phList})`;
 
     for (const ev of events) {
       const kind = str(ev['event_kind']);
@@ -633,28 +531,28 @@ export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: 
       try {
         if (kind === 'rx_packet') {
           Object.assign(row, flatMission(ev['mission']));
-          row['frame_label']   = str(ev['frame_label']);
-          row['inner_hex']     = str(ev['inner_hex']);
-          row['inner_len']     = num(ev['inner_len']);
-          row['wire_hex']      = str(ev['wire_hex']);
-          row['wire_len']      = num(ev['wire_len']);
-          row['frame_type']    = str(ev['frame_type']);
-          row['transport_meta']= str(ev['transport_meta']);
-          row['raw_hex']       = str(ev['raw_hex']);
-          row['size']          = num(ev['size']);
-          row['duplicate']     = bool(ev['duplicate']);
-          row['uplink_echo']   = bool(ev['uplink_echo']);
-          row['unknown']       = bool(ev['unknown']);
-          row['warnings']      = jsn(ev['warnings']);
-          row['mission_id']    = str(ev['mission_id'] ?? missionId);
+          row['frame_label']    = str(ev['frame_label']);
+          row['inner_hex']      = str(ev['inner_hex']);
+          row['inner_len']      = num(ev['inner_len']);
+          row['wire_hex']       = str(ev['wire_hex']);
+          row['wire_len']       = num(ev['wire_len']);
+          row['frame_type']     = str(ev['frame_type']);
+          row['transport_meta'] = str(ev['transport_meta']);
+          row['raw_hex']        = str(ev['raw_hex']);
+          row['size']           = num(ev['size']);
+          row['duplicate']      = bool(ev['duplicate']);
+          row['uplink_echo']    = bool(ev['uplink_echo']);
+          row['unknown']        = bool(ev['unknown']);
+          row['warnings']       = jsn(ev['warnings']);
+          row['mission_id']     = str(ev['mission_id'] ?? missionId);
 
         } else if (kind === 'tx_command') {
           Object.assign(row, flatMission(ev['mission']));
-          row['frame_label']   = str(ev['frame_label']);
-          row['inner_hex']     = str(ev['inner_hex']);
-          row['inner_len']     = num(ev['inner_len']);
-          row['wire_hex']      = str(ev['wire_hex']);
-          row['wire_len']      = num(ev['wire_len']);
+          row['frame_label']  = str(ev['frame_label']);
+          row['inner_hex']    = str(ev['inner_hex']);
+          row['inner_len']    = num(ev['inner_len']);
+          row['wire_hex']     = str(ev['wire_hex']);
+          row['wire_len']     = num(ev['wire_len']);
 
         } else if (kind === 'parameter') {
           row['rx_event_id']  = str(ev['rx_event_id']);
@@ -681,13 +579,13 @@ export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: 
           row['alarm_context_raw']      = jsn(ctx['raw']);
 
         } else if (kind === 'cmd_verifier') {
-          row['cmd_event_id']  = str(ev['cmd_event_id']);
-          row['instance_id']   = str(ev['instance_id']);
-          row['stage']         = str(ev['stage']);
-          row['verifier_id']   = str(ev['verifier_id']);
-          row['outcome']       = str(ev['outcome']);
-          row['elapsed_ms']    = num(ev['elapsed_ms']);
-          row['match_event_id']= ev['match_event_id'] == null ? null : str(ev['match_event_id']);
+          row['cmd_event_id']   = str(ev['cmd_event_id']);
+          row['instance_id']    = str(ev['instance_id']);
+          row['stage']          = str(ev['stage']);
+          row['verifier_id']    = str(ev['verifier_id']);
+          row['outcome']        = str(ev['outcome']);
+          row['elapsed_ms']     = num(ev['elapsed_ms']);
+          row['match_event_id'] = ev['match_event_id'] == null ? null : str(ev['match_event_id']);
 
         } else if (kind === 'radio') {
           row['radio_action']    = str(ev['radio_action']);
@@ -705,7 +603,7 @@ export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: 
           continue;
         }
 
-        evStmt.run(row);
+        await client.query(insertSql, EVENT_COLS.map((c) => row[c]));
         counts[kind] = (counts[kind] ?? 0) + 1;
       } catch (err) {
         warnings.push(`Skipped ${kind} event_id=${str(ev['event_id'])}: ${String(err)}`);
@@ -713,15 +611,18 @@ export function ingestJsonl(content: string, sourceFile: string, forcedPassId?: 
       }
     }
 
-    return passId;
-  })() as number;
-
-  resetReadDb();
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 
   // Best-effort: decode binary TLM/RES packets and save to decoded_telemetry.
-  try { materializeTelemetry(result); } catch { /* non-fatal */ }
+  try { await materializeTelemetry(passId); } catch { /* non-fatal */ }
 
-  return { passId: result, sessionId, counts, skipped, warnings };
+  return { passId, sessionId, counts, skipped, warnings };
 }
 
 // ── Decoded telemetry ─────────────────────────────────────────────────────────
@@ -742,88 +643,90 @@ export interface SummaryRow {
   count:  number;
 }
 
-// Decode all TLM/RES inner_hex frames for a pass and persist to decoded_telemetry.
-// Idempotent: deletes existing rows for this pass before inserting.
-export function materializeTelemetry(passId: number): { count: number } {
-  const db = getWriteDb();
+export async function materializeTelemetry(passId: number): Promise<{ count: number }> {
   const tbl = `pass_${passId}`;
-  if (!tableExists(db, tbl)) throw new Error(`Table ${tbl} does not exist`);
+  const client = await pool.connect();
+  try {
+    const exists = await tableExists(client, tbl);
+    if (!exists) throw new Error(`Table ${tbl} does not exist`);
 
-  db.prepare('DELETE FROM decoded_telemetry WHERE pass_id = ?').run(passId);
+    await client.query('DELETE FROM decoded_telemetry WHERE pass_id = $1', [passId]);
 
-  type FrameRow = { ts_ms: number; cmd_id: string; inner_hex: string };
-  const rows = db.prepare(`
-    SELECT ts_ms,
-           mission_facts_header_cmd_id AS cmd_id,
-           inner_hex
-    FROM   "${tbl}"
-    WHERE  event_kind IN ('rx_packet', 'tx_command')
-      AND  mission_facts_header_ptype IN ('TLM', 'RES')
-      AND  inner_hex IS NOT NULL AND inner_hex != ''
-    ORDER  BY ts_ms ASC
-  `).all() as FrameRow[];
+    type FrameRow = { ts_ms: number; cmd_id: string; inner_hex: string };
+    const rows = (await client.query(`
+      SELECT ts_ms,
+             mission_facts_header_cmd_id AS cmd_id,
+             inner_hex
+      FROM   "${tbl}"
+      WHERE  event_kind IN ('rx_packet', 'tx_command')
+        AND  mission_facts_header_ptype IN ('TLM', 'RES')
+        AND  inner_hex IS NOT NULL AND inner_hex != ''
+      ORDER  BY ts_ms ASC
+    `)).rows as FrameRow[];
 
-  const insert = db.prepare(
-    'INSERT INTO decoded_telemetry (pass_id, ts_ms, cmd_id, field, value, unit) VALUES (?, ?, ?, ?, ?, ?)',
-  );
-
-  let count = 0;
-  db.transaction(() => {
-    for (const row of rows) {
-      if (!row.cmd_id) continue;
-      const decoded = decodeRow(row.cmd_id, row.inner_hex);
-      for (const f of decoded) {
-        insert.run(passId, row.ts_ms, row.cmd_id, f.field, f.value, f.unit);
-        count++;
+    let count = 0;
+    await client.query('BEGIN');
+    try {
+      for (const row of rows) {
+        if (!row.cmd_id) continue;
+        const decoded = decodeRow(row.cmd_id, row.inner_hex);
+        for (const f of decoded) {
+          await client.query(
+            'INSERT INTO decoded_telemetry (pass_id, ts_ms, cmd_id, field, value, unit) VALUES ($1,$2,$3,$4,$5,$6)',
+            [passId, row.ts_ms, row.cmd_id, f.field, f.value, f.unit],
+          );
+          count++;
+        }
       }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
     }
-  })();
-
-  return { count };
+    return { count };
+  } finally {
+    client.release();
+  }
 }
 
-// Return cmd/field summary (distinct cmd_id, field, unit + count) for a set of passes.
-export function fetchDecodedSummary(passIds: number[]): SummaryRow[] {
+export async function fetchDecodedSummary(passIds: number[]): Promise<SummaryRow[]> {
   if (passIds.length === 0) return [];
-  const db  = getDb();
-  const ph  = passIds.map(() => '?').join(',');
-  return db.prepare(`
+  const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
+  const res = await pool.query(`
     SELECT cmd_id, field, MAX(unit) AS unit, COUNT(*) AS count
     FROM   decoded_telemetry
     WHERE  pass_id IN (${ph})
     GROUP  BY cmd_id, field
     ORDER  BY cmd_id, field
-  `).all(...passIds) as SummaryRow[];
+  `, passIds);
+  return res.rows as SummaryRow[];
 }
 
-// Return all decoded rows for given passes + a specific cmd_id, ordered by time.
-export function fetchDecodedTelemetry(passIds: number[], cmd: string): DecodedRow[] {
+export async function fetchDecodedTelemetry(passIds: number[], cmd: string): Promise<DecodedRow[]> {
   if (passIds.length === 0) return [];
-  const db = getDb();
-  const ph = passIds.map(() => '?').join(',');
-  return db.prepare(`
+  const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
+  const res = await pool.query(`
     SELECT pass_id, ts_ms, cmd_id, field, value, unit
     FROM   decoded_telemetry
-    WHERE  pass_id IN (${ph}) AND cmd_id = ?
+    WHERE  pass_id IN (${ph}) AND cmd_id = $${passIds.length + 1}
     ORDER  BY ts_ms ASC
-  `).all(...passIds, cmd) as DecodedRow[];
+  `, [...passIds, cmd]);
+  return res.rows as DecodedRow[];
 }
 
-// Return { pass_id -> decoded row count } for a set of passes.
-export function fetchDecodeStatus(passIds: number[]): Record<number, number> {
+export async function fetchDecodeStatus(passIds: number[]): Promise<Record<number, number>> {
   if (passIds.length === 0) return {};
-  const db  = getDb();
-  const ph  = passIds.map(() => '?').join(',');
-  const rows = db.prepare(`
+  const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
+  const res = await pool.query(`
     SELECT pass_id, COUNT(*) AS cnt
     FROM   decoded_telemetry
     WHERE  pass_id IN (${ph})
     GROUP  BY pass_id
-  `).all(...passIds) as { pass_id: number; cnt: number }[];
-  return Object.fromEntries(rows.map(r => [r.pass_id, r.cnt]));
+  `, passIds);
+  return Object.fromEntries((res.rows as { pass_id: number; cnt: number }[]).map(r => [r.pass_id, r.cnt]));
 }
 
-/* ─── Manual beacon entry ─────────────────────────────────────────────────── */
+// ── Manual beacon entry ───────────────────────────────────────────────────────
 
 export interface BeaconPreview {
   lineIndex: number;
@@ -851,51 +754,68 @@ export function previewBeacons(hexLines: string[]): BeaconPreview[] {
   }).filter(p => p.hex !== '');
 }
 
-export function insertBeacons(passId: number, hexLines: string[]): number {
-  const db = getDb();
+export async function insertBeacons(passId: number, hexLines: string[]): Promise<number> {
   const tableName = `pass_${passId}`;
-  if (!tableExists(db, tableName)) throw new Error(`Pass ${passId} does not exist`);
+  const client = await pool.connect();
+  try {
+    const exists = await tableExists(client, tableName);
+    if (!exists) throw new Error(`Pass ${passId} does not exist`);
 
-  const colList = EVENT_COLS.join(', ');
-  const phList = EVENT_COLS.map(() => '?').join(', ');
-  const stmt = db.prepare(`INSERT INTO "${tableName}" (${colList}) VALUES (${phList})`);
+    const colList = EVENT_COLS.join(', ');
+    const phList  = EVENT_COLS.map((_, i) => `$${i + 1}`).join(', ');
+    const insertSql = `INSERT INTO "${tableName}" (${colList}) VALUES (${phList})`;
 
-  const now = Date.now();
-  const nowIso = new Date(now).toISOString();
+    const now    = Date.now();
+    const nowIso = new Date(now).toISOString();
 
-  let count = 0;
-  db.transaction(() => {
-    for (const raw of hexLines) {
-      const hex = raw.trim().replace(/\s+/g, '');
-      if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) continue;
-      const parsed = parseInnerHex(hex);
-      const row = emptyRow();
-      row['event_kind'] = 'rx_packet';
-      row['ts_ms'] = now;
-      row['ts_iso'] = nowIso;
-      row['inner_hex'] = hex;
-      row['inner_len'] = hex.length / 2;
-      row['mission_facts_header_cmd_id'] = parsed?.cmdName ?? null;
-      row['mission_facts_header_ptype'] = 'TLM';
-      stmt.run(EVENT_COLS.map((c) => row[c]));
-      count++;
+    let count = 0;
+    await client.query('BEGIN');
+    try {
+      for (const raw of hexLines) {
+        const hex = raw.trim().replace(/\s+/g, '');
+        if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) continue;
+        const parsed = parseInnerHex(hex);
+        const row = emptyRow();
+        row['event_kind'] = 'rx_packet';
+        row['ts_ms']      = now;
+        row['ts_iso']     = nowIso;
+        row['inner_hex']  = hex;
+        row['inner_len']  = hex.length / 2;
+        row['mission_facts_header_cmd_id']  = parsed?.cmdName ?? null;
+        row['mission_facts_header_ptype']   = 'TLM';
+        await client.query(insertSql, EVENT_COLS.map((c) => row[c]));
+        count++;
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
     }
-  })();
 
-  materializeTelemetry(passId);
-  resetReadDb();
-  return count;
+    await materializeTelemetry(passId);
+    return count;
+  } finally {
+    client.release();
+  }
 }
 
-export function deletePass(passId: number): void {
-  const db = getDb();
-  db.exec(`DROP TABLE IF EXISTS pass_${passId}`);
-  db.prepare('DELETE FROM passes WHERE pass_id = ?').run(passId);
-  db.prepare('DELETE FROM decoded_telemetry WHERE pass_id = ?').run(passId);
-  resetReadDb();
+export async function deletePass(passId: number): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DROP TABLE IF EXISTS "pass_${passId}"`);
+    await client.query('DELETE FROM passes WHERE pass_id = $1', [passId]);
+    await client.query('DELETE FROM decoded_telemetry WHERE pass_id = $1', [passId]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-/* ─── File assembly ───────────────────────────────────────────────────────── */
+// ── File assembly ─────────────────────────────────────────────────────────────
 
 export const FILES_DIR = resolve(process.cwd(), 'assembled_files');
 
@@ -906,8 +826,8 @@ function parseInnerHexServer(hex: string): Buffer | null {
   try {
     const b = Buffer.from(hex, 'hex');
     if (b.length < INNER_HDR + 2) return null;
-    const nameLen = b[INNER_HDR];
-    const argsLen = b[INNER_HDR + 1];
+    const nameLen  = b[INNER_HDR];
+    const argsLen  = b[INNER_HDR + 1];
     const argsStart = INNER_HDR + 2 + nameLen + 1;
     if (argsStart > b.length) return null;
     return b.subarray(argsStart, argsStart + argsLen);
@@ -943,23 +863,21 @@ export interface AssembledFileInfo {
   chunkCount: number;
 }
 
-export function assembleFilesForTable(tableId: string): AssembledFileInfo[] {
+export async function assembleFilesForTable(tableId: string): Promise<AssembledFileInfo[]> {
   if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
-  const db = getDb();
 
-  const rows = db.prepare(`
+  const res = await pool.query(`
     SELECT inner_hex
     FROM "${tableId}"
     WHERE event_kind = 'rx_packet'
       AND mission_facts_header_ptype = 'FILE'
       AND inner_hex IS NOT NULL
     ORDER BY ts_ms ASC
-  `).all() as { inner_hex: string }[];
+  `);
 
-  // filename → Map<index, Buffer>
   const fileMap = new Map<string, Map<number, Buffer>>();
 
-  for (const row of rows) {
+  for (const row of res.rows as { inner_hex: string }[]) {
     const argsBytes = parseInnerHexServer(row.inner_hex);
     if (!argsBytes || argsBytes.length === 0) continue;
     const chunk = parseFileChunkServer(argsBytes);
@@ -974,7 +892,7 @@ export function assembleFilesForTable(tableId: string): AssembledFileInfo[] {
 
   const results: AssembledFileInfo[] = [];
   for (const [filename, chunks] of fileMap) {
-    const sorted = [...chunks.keys()].sort((a, b) => a - b).map(i => chunks.get(i)!);
+    const sorted   = [...chunks.keys()].sort((a, b) => a - b).map(i => chunks.get(i)!);
     const assembled = Buffer.concat(sorted);
     writeFileSync(join(outDir, filename), assembled);
     results.push({ filename, totalBytes: assembled.length, chunkCount: chunks.size });

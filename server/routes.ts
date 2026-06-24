@@ -14,18 +14,18 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200
 export const router = Router();
 
 // Cache schema in memory — it's static for this dataset
-let schemaCache: ReturnType<typeof loadSchema> | null = null;
+let schemaCache: Awaited<ReturnType<typeof loadSchema>> | null = null;
 
-router.get('/schema', (_req, res) => {
+router.get('/schema', async (_req, res) => {
   try {
-    if (!schemaCache) schemaCache = loadSchema();
+    if (!schemaCache) schemaCache = await loadSchema();
     res.json(schemaCache);
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-router.post('/ingest', upload.single('file'), (req, res) => {
+router.post('/ingest', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) { res.status(400).json({ error: 'No file uploaded' }); return; }
     const { originalname, buffer } = req.file;
@@ -33,8 +33,7 @@ router.post('/ingest', upload.single('file'), (req, res) => {
     const forcedPassId = req.body?.passId ? parseInt(req.body.passId as string, 10) : undefined;
 
     if (originalname.endsWith('.jsonl') || originalname.endsWith('.ndjson')) {
-      const result = ingestJsonl(content, originalname, forcedPassId);
-      // Invalidate schema cache so row counts refresh
+      const result = await ingestJsonl(content, originalname, forcedPassId);
       schemaCache = null;
       res.json(result);
     } else {
@@ -45,12 +44,12 @@ router.post('/ingest', upload.single('file'), (req, res) => {
   }
 });
 
-router.get('/tables/:tableId', (req, res) => {
+router.get('/tables/:tableId', async (req, res) => {
   try {
     const { tableId } = req.params;
     const { limit, offset, sort, dir } = req.query as Record<string, string>;
-    const rows = fetchRows(tableId, {
-      limit: limit ? parseInt(limit, 10) : 1000,
+    const rows = await fetchRows(tableId, {
+      limit:  limit  ? parseInt(limit, 10) : 1000,
       offset: offset ? parseInt(offset, 10) : 0,
       sort,
       dir,
@@ -61,30 +60,25 @@ router.get('/tables/:tableId', (req, res) => {
   }
 });
 
-// Frames endpoint — returns only rx_packet and tx_command rows that have inner_hex data,
-// used by the decoded-frames tab to avoid fetching all 40k+ rows.
-router.get('/tables/:tableId/frames', (req, res) => {
+router.get('/tables/:tableId/frames', async (req, res) => {
   try {
-    const rows = fetchFramePackets(req.params.tableId);
+    const rows = await fetchFramePackets(req.params.tableId);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-// Assemble all FILE packets for a table and write them to assembled_files/<tableId>/.
-// Idempotent: existing files are overwritten with fresh data from the database.
-router.post('/tables/:tableId/assemble-files', (req, res) => {
+router.post('/tables/:tableId/assemble-files', async (req, res) => {
   try {
-    const files = assembleFilesForTable(req.params.tableId);
+    const files = await assembleFilesForTable(req.params.tableId);
     res.json({ files });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-// List already-assembled files for a table (fast — reads directory only).
-router.get('/tables/:tableId/assembled-files', (req, res) => {
+router.get('/tables/:tableId/assembled-files', async (req, res) => {
   try {
     const files = listAssembledFiles(req.params.tableId);
     res.json({ files });
@@ -93,7 +87,6 @@ router.get('/tables/:tableId/assembled-files', (req, res) => {
   }
 });
 
-// Serve an assembled file (download or inline for images).
 router.get('/tables/:tableId/assembled-files/:filename', (req, res) => {
   const { tableId, filename } = req.params;
   if (!/^\w+$/.test(tableId) || filename.includes('/') || filename.includes('..')) {
@@ -110,43 +103,39 @@ function parsePassIds(raw: unknown): number[] {
   return String(raw ?? '').split(',').map(Number).filter(n => n > 0 && !isNaN(n));
 }
 
-// Decode and persist TLM/RES frames for one pass into decoded_telemetry.
-router.post('/history/materialize', (req, res) => {
+router.post('/history/materialize', async (req, res) => {
   const { passId } = req.body as { passId?: number };
   if (!passId) { res.status(400).json({ error: 'passId required' }); return; }
   try {
-    const result = materializeTelemetry(Number(passId));
+    const result = await materializeTelemetry(Number(passId));
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-// cmd_id + field summary for selected passes (used to populate the field picker).
-router.get('/history/summary', (req, res) => {
+router.get('/history/summary', async (req, res) => {
   try {
-    res.json(fetchDecodedSummary(parsePassIds(req.query.passIds)));
+    res.json(await fetchDecodedSummary(parsePassIds(req.query.passIds)));
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-// Decoded rows for selected passes + a specific cmd_id.
-router.get('/history/data', (req, res) => {
+router.get('/history/data', async (req, res) => {
   const passIds = parsePassIds(req.query.passIds);
   const cmd = String(req.query.cmd ?? '');
   if (!cmd) { res.status(400).json({ error: 'cmd required' }); return; }
   try {
-    res.json(fetchDecodedTelemetry(passIds, cmd));
+    res.json(await fetchDecodedTelemetry(passIds, cmd));
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-// How many decoded rows exist per pass (to show materialization status).
-router.get('/history/status', (req, res) => {
+router.get('/history/status', async (req, res) => {
   try {
-    res.json(fetchDecodeStatus(parsePassIds(req.query.passIds)));
+    res.json(await fetchDecodeStatus(parsePassIds(req.query.passIds)));
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -154,7 +143,6 @@ router.get('/history/status', (req, res) => {
 
 // ─── Manual beacon entry ─────────────────────────────────────────────────────
 
-// Parse hex strings and return decoded field previews (no DB writes).
 router.post('/beacons/preview', (req, res) => {
   const { hexLines } = req.body as { hexLines?: string[] };
   if (!Array.isArray(hexLines) || hexLines.length === 0) {
@@ -167,8 +155,7 @@ router.post('/beacons/preview', (req, res) => {
   }
 });
 
-// Insert previewed beacons into a pass table and re-materialize decoded telemetry.
-router.post('/beacons/insert', (req, res) => {
+router.post('/beacons/insert', async (req, res) => {
   const { hexLines, passId } = req.body as { hexLines?: string[]; passId?: number };
   if (!Array.isArray(hexLines) || hexLines.length === 0) {
     res.status(400).json({ error: 'hexLines array required' }); return;
@@ -177,7 +164,7 @@ router.post('/beacons/insert', (req, res) => {
     res.status(400).json({ error: 'passId required' }); return;
   }
   try {
-    const count = insertBeacons(Number(passId), hexLines);
+    const count = await insertBeacons(Number(passId), hexLines);
     schemaCache = null;
     res.json({ count });
   } catch (err) {
@@ -185,8 +172,7 @@ router.post('/beacons/insert', (req, res) => {
   }
 });
 
-// Delete a pass and all associated data. Requires password in request body.
-router.delete('/passes/:passId', (req, res) => {
+router.delete('/passes/:passId', async (req, res) => {
   const { password } = req.body as { password?: string };
   if (password !== 'maveric') {
     res.status(403).json({ error: 'Incorrect password' }); return;
@@ -196,7 +182,7 @@ router.delete('/passes/:passId', (req, res) => {
     res.status(400).json({ error: 'Invalid passId' }); return;
   }
   try {
-    deletePass(passId);
+    await deletePass(passId);
     schemaCache = null;
     res.json({ ok: true });
   } catch (err) {
@@ -205,7 +191,7 @@ router.delete('/passes/:passId', (req, res) => {
 });
 
 // ─── Live telemetry SSE stream ────────────────────────────────────────────────
-// Tails a JSONL file and pushes each new line to the client as an SSE event.
+
 router.get('/live/stream', (req, res) => {
   const rawPath = req.query.path as string;
   if (!rawPath || !/\.(jsonl|ndjson)$/i.test(rawPath)) {
@@ -226,7 +212,7 @@ router.get('/live/stream', (req, res) => {
       if (!existsSync(rawPath)) return;
       const size = statSync(rawPath).size;
       if (size <= byteOffset) return;
-      const fd = openSync(rawPath, 'r');
+      const fd  = openSync(rawPath, 'r');
       const len = size - byteOffset;
       const buf = Buffer.alloc(len);
       const read = readSync(fd, buf, 0, len, byteOffset);
@@ -243,12 +229,11 @@ router.get('/live/stream', (req, res) => {
   };
 
   flush();
-  const poll = setInterval(flush, 500);
+  const poll      = setInterval(flush, 500);
   const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 20000);
   req.on('close', () => { clearInterval(poll); clearInterval(heartbeat); });
 });
 
-// Load all events from a JSONL file and return them as JSON (no ingestion).
 router.get('/live/load', (req, res) => {
   const rawPath = req.query.path as string;
   if (!rawPath || !/\.(jsonl|ndjson)$/i.test(rawPath)) {
@@ -269,8 +254,7 @@ router.get('/live/load', (req, res) => {
   }
 });
 
-// Ingest a JSONL file from disk into the database.
-router.post('/live/ingest', (req, res) => {
+router.post('/live/ingest', async (req, res) => {
   try {
     const body = req.body as { filePath?: string; passId?: number };
     const { filePath: rawPath, passId } = body;
@@ -280,9 +264,9 @@ router.post('/live/ingest', (req, res) => {
     if (!existsSync(rawPath)) {
       res.status(404).json({ error: 'File not found' }); return;
     }
-    const content = readFileSync(rawPath, 'utf-8');
+    const content  = readFileSync(rawPath, 'utf-8');
     const fileName = rawPath.split('/').pop() ?? rawPath;
-    const result = ingestJsonl(content, fileName, passId);
+    const result   = await ingestJsonl(content, fileName, passId);
     schemaCache = null;
     res.json(result);
   } catch (err) {

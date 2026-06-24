@@ -407,7 +407,7 @@ function buildExchanges(rows: Row[]): Exchange[] {
       src:       (r.mission_facts_header_src as string) ?? '',
       dst:       (r.mission_facts_header_dest as string) ?? '',
       innerHex:  r.inner_hex as string | null,
-      parsed:    r.inner_hex ? parseInner(r.inner_hex as string) : null,
+      parsed:    null, // deferred — computed in ExchangeCard on expand
       intOk:     r.mission_facts_integrity_overall_ok != null
         ? r.mission_facts_integrity_overall_ok === '1' : null,
       eventKind: r.event_kind as string,
@@ -417,27 +417,33 @@ function buildExchanges(rows: Row[]): Exchange[] {
     }));
 
   const exchanges: Exchange[] = [];
+  // O(1) lookup: maps a window key → the most-recent open exchange for that key
+  const recent = new Map<string, Exchange>();
 
   for (const p of pkts) {
     const isFile = p.ptype === 'FILE';
     const win = isFile ? FILE_WIN : CMD_WIN;
 
+    // For FILE grouping we need the filename. Parse only FILE packets' hex
+    // here (typically a small fraction of the total) so the main loop stays fast.
     let fileName: string | undefined;
-    if (isFile && p.parsed) {
-      if (p.parsed.argsText) {
-        fileName = p.parsed.argsText.split(' ')[0];
-      } else if (p.parsed.argsBytes.length > 0) {
-        const fc = parseFileChunk(p.parsed.argsBytes);
-        if (fc) fileName = fc.filename;
+    if (isFile && p.innerHex) {
+      const fp = parseInner(p.innerHex);
+      if (fp) {
+        if (fp.argsText) {
+          fileName = fp.argsText.split(' ')[0];
+        } else if (fp.argsBytes.length > 0) {
+          const fc = parseFileChunk(fp.argsBytes);
+          if (fc) fileName = fc.filename;
+        }
       }
     }
 
-    const hit = [...exchanges].reverse().find(e => {
-      if (e.cmdId !== p.cmdId) return false;
-      if (p.ts - e.ts > win) return false;
-      if (isFile && fileName && e.fileName && e.fileName !== fileName) return false;
-      return true;
-    });
+    // Key: for named file transfers include the filename so different files
+    // with the same cmdId don't merge; otherwise key by cmdId alone.
+    const key = isFile && fileName ? `${p.cmdId}:${fileName}` : p.cmdId;
+    const candidate = recent.get(key);
+    const hit = candidate && p.ts - candidate.ts <= win ? candidate : undefined;
 
     if (hit) {
       hit.packets.push(p);
@@ -447,7 +453,7 @@ function buildExchanges(rows: Row[]): Exchange[] {
         hit.chunkCount = (hit.chunkCount ?? 0) + 1;
       }
     } else {
-      exchanges.push({
+      const ex: Exchange = {
         id: `${p.cmdId}_${p.ts}`,
         ts: p.ts,
         cmdId: p.cmdId,
@@ -455,7 +461,9 @@ function buildExchanges(rows: Row[]): Exchange[] {
         isFile,
         fileName: isFile ? fileName : undefined,
         chunkCount: isFile ? 1 : undefined,
-      });
+      };
+      exchanges.push(ex);
+      recent.set(key, ex);
     }
   }
 
@@ -597,26 +605,35 @@ function BinaryPayload({ bytes, cmdId }: { bytes: Uint8Array; cmdId: string }) {
 function ExchangeCard({ exchange }: { exchange: Exchange }) {
   const [expanded, setExpanded] = useState(false);
 
-  const ptypeCounts = exchange.packets.reduce<Record<string, number>>((acc, p) => {
+  // Parse inner hex only when the card is expanded -- keeps initial render cheap.
+  const packets = useMemo(() => {
+    if (!expanded) return exchange.packets;
+    return exchange.packets.map(p => ({
+      ...p,
+      parsed: p.parsed ?? (p.innerHex ? parseInner(p.innerHex) : null),
+    }));
+  }, [expanded, exchange.packets]);
+
+  const ptypeCounts = packets.reduce<Record<string, number>>((acc, p) => {
     acc[p.ptype] = (acc[p.ptype] ?? 0) + 1;
     return acc;
   }, {});
 
   // Find primary response/TLM packet (not CMD, prefer TLM > FILE > RES > ACK)
-  const cmdPkt = exchange.packets.find(p => p.ptype === 'CMD');
+  const cmdPkt = packets.find(p => p.ptype === 'CMD');
   const resPkt =
-    exchange.packets.find(p => p.ptype === 'TLM') ??
-    exchange.packets.find(p => p.ptype === 'RES') ??
-    exchange.packets.find(p => p.ptype === 'FILE');
+    packets.find(p => p.ptype === 'TLM') ??
+    packets.find(p => p.ptype === 'RES') ??
+    packets.find(p => p.ptype === 'FILE');
 
-  const filePkts = exchange.packets.filter(p => p.ptype === 'FILE');
+  const filePkts = packets.filter(p => p.ptype === 'FILE');
 
   // Integrity: pass only if all non-CMD packets with intOk info are ok
-  const hasIntegrity = exchange.packets.some(p => p.intOk !== null);
-  const allOk = exchange.packets.filter(p => p.intOk !== null).every(p => p.intOk);
+  const hasIntegrity = packets.some(p => p.intOk !== null);
+  const allOk = packets.filter(p => p.intOk !== null).every(p => p.intOk);
 
-  const flowSrc = cmdPkt?.src ?? resPkt?.src ?? exchange.packets[0]?.src ?? '';
-  const flowDst = cmdPkt?.dst ?? resPkt?.dst ?? exchange.packets[0]?.dst ?? '';
+  const flowSrc = cmdPkt?.src ?? resPkt?.src ?? packets[0]?.src ?? '';
+  const flowDst = cmdPkt?.dst ?? resPkt?.dst ?? packets[0]?.dst ?? '';
 
   return (
     <div style={{
@@ -694,15 +711,15 @@ function ExchangeCard({ exchange }: { exchange: Exchange }) {
           borderTop: `1px solid ${C.borderSubtle}`,
           backgroundColor: 'rgba(0,0,0,0.2)',
         }}>
-          {exchange.packets.map((pkt, i) => {
+          {packets.map((pkt, i) => {
             const clr = PTYPE_CLR[pkt.ptype] ?? PTYPE_CLR['CMD'];
             const p = pkt.parsed;
 
             // For FILE packets in a multi-chunk transfer, collapse all into a single summary card
             if (pkt.ptype === 'FILE' && (exchange.chunkCount ?? 0) > 1) {
-              const firstFileIdx = exchange.packets.findIndex(x => x.ptype === 'FILE');
+              const firstFileIdx = packets.findIndex(x => x.ptype === 'FILE');
               if (i !== firstFileIdx) return null; // only render once, at first FILE packet position
-              const filePackets = exchange.packets.filter(x => x.ptype === 'FILE');
+              const filePackets = packets.filter(x => x.ptype === 'FILE');
               const fileCount = filePackets.length;
               const totalBytes = filePackets.reduce((sum, x) => sum + (x.parsed?.argsLen ?? 0), 0);
               const isImage = exchange.fileName && IMAGE_EXTS.test(exchange.fileName);
@@ -1027,9 +1044,13 @@ function buildTimeline(exchanges: Exchange[]): TimelineEntry[] {
     const dataPkt =
       ex.packets.find(p => p.ptype === 'TLM') ??
       ex.packets.find(p => p.ptype === 'RES');
-    if (!dataPkt?.parsed) continue;
+    if (!dataPkt) continue;
+    // parsed is deferred in buildExchanges, so decode the inner hex here.
+    const parsed = dataPkt.parsed ?? (dataPkt.innerHex ? parseInner(dataPkt.innerHex) : null);
+    if (!parsed) continue;
 
-    const { cmdId, ptype, ts: pktTs, parsed: { argsBytes, argsText, isBinary } } = dataPkt;
+    const { cmdId, ptype, ts: pktTs } = dataPkt;
+    const { argsBytes, argsText, isBinary } = parsed;
     let sections: DecodedSection[] | null = null;
 
     if (isBinary && argsBytes.length > 0) {
@@ -1151,10 +1172,12 @@ function splitNumericValue(raw: string): { num: number; unit: string } | null {
   return { num, unit };
 }
 
-export function TelemetryTab({ tableId, defaultCmd }: { tableId: string; defaultCmd?: string }) {
+export function TelemetryTab({ tableId, defaultCmd, sourceFile }: { tableId: string; defaultCmd?: string; sourceFile?: string }) {
   const { rows, loading } = useFramePackets(tableId);
   const [selectedCmd, setSelectedCmd] = useState<string | null>(defaultCmd ?? null);
   const [selectedCol, setSelectedCol] = useState<string | null>(null);
+  const [showExport, setShowExport] = useState(false);
+  const [exportFields, setExportFields] = useState<Set<string>>(new Set());
 
   const exchanges = useMemo(() => buildExchanges(rows), [rows]);
   const allEntries = useMemo(() => buildTimeline(exchanges), [exchanges]);
@@ -1240,6 +1263,39 @@ export function TelemetryTab({ tableId, defaultCmd }: { tableId: string; default
     };
   }, [selectedCol, pivotRows, seriesPoints]);
 
+  // Keep export field selection in sync when the active command (and its columns) changes.
+  // Use a join-key so the effect only fires when the column list actually changes.
+  const colNamesKey = colNames.join('\x00');
+  useEffect(() => {
+    setExportFields(new Set(colNames));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [colNamesKey]);
+
+  const handleExportCsv = () => {
+    const cols = colNames.filter(c => exportFields.has(c));
+    const header = ['ts_ms', 'time_utc', ...cols];
+    const lines = [header.join(',')];
+    for (const row of [...pivotRows].reverse()) {
+      const cells = [
+        String(row.ts),
+        new Date(row.ts).toISOString(),
+        ...cols.map(c => {
+          const v = row.fields.get(c) ?? '';
+          return (v.includes(',') || v.includes('"') || v.includes('\n'))
+            ? `"${v.replace(/"/g, '""')}"` : v;
+        }),
+      ];
+      lines.push(cells.join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${activeCmd ?? 'telemetry'}_export.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const COL_W = 88;
   const TS_W  = 96;
 
@@ -1248,6 +1304,20 @@ export function TelemetryTab({ tableId, defaultCmd }: { tableId: string; default
 
       {/* ── Table area ── */}
       <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, minHeight: 0 }}>
+
+        {/* Title — name the decoded telemetry table after its source file */}
+        <div style={{
+          display: 'flex', alignItems: 'baseline', gap: 8, flexShrink: 0,
+          padding: '5px 12px', borderBottom: `1px solid ${C.borderSubtle}`,
+          backgroundColor: C.bgPanel, fontFamily: C.fontMono,
+        }}>
+          <span style={{ fontSize: 9.5, color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+            decoded telemetry
+          </span>
+          <span style={{ fontSize: 12, color: C.textPrimary }}>
+            {sourceFile || tableId}
+          </span>
+        </div>
 
         {/* Command selector */}
         <div style={{
@@ -1276,7 +1346,95 @@ export function TelemetryTab({ tableId, defaultCmd }: { tableId: string; default
             {' · '}
             <span style={{ color: C.textPrimary }}>{colNames.length}</span> fields
           </span>
+          {pivotRows.length > 0 && (
+            <button
+              onClick={() => setShowExport(v => !v)}
+              style={{
+                padding: '2px 10px', borderRadius: 3, cursor: 'pointer',
+                fontSize: 10, fontFamily: C.fontMono,
+                backgroundColor: showExport ? C.activeFill : 'transparent',
+                color: showExport ? C.active : C.textMuted,
+                border: `1px solid ${showExport ? `${C.active}44` : C.borderSubtle}`,
+              }}
+            >
+              ↓ Export CSV
+            </button>
+          )}
         </div>
+
+        {/* Field picker for CSV export */}
+        {showExport && pivotRows.length > 0 && (
+          <div style={{
+            flexShrink: 0, borderBottom: `1px solid ${C.borderStrong}`,
+            backgroundColor: C.bgPanel, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 8,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                fields to export
+              </span>
+              <span style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled }}>
+                ({exportFields.size} / {colNames.length})
+              </span>
+              <button
+                onClick={() => setExportFields(new Set(colNames))}
+                style={{ padding: '1px 7px', borderRadius: 2, cursor: 'pointer', fontSize: 9, fontFamily: C.fontMono, backgroundColor: C.bgApp, color: C.textMuted, border: `1px solid ${C.borderSubtle}` }}
+              >all</button>
+              <button
+                onClick={() => setExportFields(new Set())}
+                style={{ padding: '1px 7px', borderRadius: 2, cursor: 'pointer', fontSize: 9, fontFamily: C.fontMono, backgroundColor: C.bgApp, color: C.textMuted, border: `1px solid ${C.borderSubtle}` }}
+              >none</button>
+              <button
+                onClick={handleExportCsv}
+                disabled={exportFields.size === 0}
+                style={{
+                  marginLeft: 'auto', padding: '3px 14px', borderRadius: 3, cursor: exportFields.size === 0 ? 'not-allowed' : 'pointer',
+                  fontSize: 10.5, fontFamily: C.fontMono, fontWeight: 700,
+                  backgroundColor: exportFields.size > 0 ? C.active : C.bgPanelRaised,
+                  color: exportFields.size > 0 ? C.bgApp : C.textDisabled,
+                  border: 'none',
+                }}
+              >
+                ↓ Download {pivotRows.length} rows
+              </button>
+            </div>
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: '3px 6px',
+              maxHeight: 88, overflowY: 'auto',
+              padding: '4px 6px',
+              backgroundColor: C.bgApp, border: `1px solid ${C.borderSubtle}`, borderRadius: 3,
+            }}>
+              {colNames.map(col => {
+                const checked = exportFields.has(col);
+                return (
+                  <label
+                    key={col}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 4,
+                      padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
+                      backgroundColor: checked ? C.activeFill : 'transparent',
+                      border: `1px solid ${checked ? `${C.active}44` : C.borderSubtle}`,
+                      fontSize: 10, fontFamily: C.fontMono,
+                      color: checked ? C.active : C.textMuted,
+                      userSelect: 'none',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => {
+                        const next = new Set(exportFields);
+                        checked ? next.delete(col) : next.add(col);
+                        setExportFields(next);
+                      }}
+                      style={{ display: 'none' }}
+                    />
+                    {col}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Pivot table */}
         <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
@@ -1502,10 +1660,16 @@ interface DecodedFramesTabProps {
   tableId: string;
 }
 
+const PAGE = 100;
+
 export function DecodedFramesTab({ tableId }: DecodedFramesTabProps) {
   const { rows, loading } = useFramePackets(tableId);
   const [filter, setFilter] = useState('');
   const [ptypeFilter, setPtypeFilter] = useState<Set<string>>(new Set());
+  const [visibleCount, setVisibleCount] = useState(PAGE);
+
+  // Reset pagination when table or filters change
+  useEffect(() => { setVisibleCount(PAGE); }, [tableId, filter, ptypeFilter]);
 
   const exchanges = useMemo(() => buildExchanges(rows), [rows]);
 
@@ -1607,9 +1771,26 @@ export function DecodedFramesTab({ tableId }: DecodedFramesTabProps) {
             {rows.length === 0 ? 'no packet events in this table' : 'no exchanges match filter'}
           </div>
         )}
-        {!loading && filtered.map(e => (
+        {!loading && filtered.slice(0, visibleCount).map(e => (
           <ExchangeCard key={e.id} exchange={e} />
         ))}
+        {!loading && visibleCount < filtered.length && (
+          <div style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
+            <button
+              onClick={() => setVisibleCount(n => n + PAGE)}
+              style={{
+                padding: '5px 16px', fontSize: 11, fontFamily: C.fontMono,
+                backgroundColor: C.bgPanelRaised, color: C.textMuted,
+                border: `1px solid ${C.borderSubtle}`, borderRadius: 3, cursor: 'pointer',
+              }}
+            >
+              show more
+            </button>
+            <span style={{ fontSize: 10, color: C.textDisabled, fontFamily: C.fontMono }}>
+              {visibleCount} of {filtered.length} exchanges
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
