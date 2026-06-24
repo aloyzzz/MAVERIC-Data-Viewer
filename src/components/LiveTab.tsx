@@ -46,6 +46,17 @@ const PASS_COLORS = [
   '#a78bfa', '#f472b6', '#34d399', '#fb923c', '#e879f9',
 ];
 
+// ── Free-form layout ──────────────────────────────────────────────────────────
+
+interface Layout { x: number; y: number; w: number; h: number }
+
+const SNAP_PX         = 8;
+const CHART_GAP       = 8;
+const CHART_PAD       = 10;
+const CHART_DEFAULT_H = 180;
+const CHART_MIN_W     = 200;
+const CHART_MIN_H     = 80;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Binary search for nearest point to a given timestamp (data must be sorted asc by ts).
@@ -79,6 +90,8 @@ function fmtY(v: number): string {
   return parseFloat(v.toPrecision(4)).toString();
 }
 
+function snap(v: number): number { return Math.round(v / SNAP_PX) * SNAP_PX; }
+
 function fmtDate(d: string, t: string) {
   return `${d} ${t}`.trim() || '—';
 }
@@ -92,20 +105,36 @@ interface HoverState {
 }
 
 function ParamChart({
-  field, unit, series, passColorMap, startMs, endMs, showXAxis,
+  field, unit, series, passColorMap, fieldColor, startMs, endMs, showXAxis,
 }: {
   field: string;
   unit: string;
   series: { passId: number; data: Series[] }[];
   passColorMap: Map<number, string>;
+  fieldColor?: string;
   startMs: number;
   endMs: number;
   showXAxis: boolean;
 }) {
-  const W = 1000;
   const PAD_L = 62; const PAD_R = 12; const PAD_T = 8;
   const PAD_B = showXAxis ? 22 : 5;
-  const H = 78 + (showXAxis ? 16 : 0);
+
+  // Track actual container pixel size so viewBox always matches — prevents text distortion.
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dims, setDims] = useState({ w: 600, h: 140 });
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      if (width > 0 && height > 0) setDims({ w: Math.round(width), h: Math.round(height) });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const W = dims.w;
+  const H = dims.h;
   const cW = W - PAD_L - PAD_R;
   const cH = H - PAD_T - PAD_B;
   const tRange = endMs - startMs || 1;
@@ -125,6 +154,9 @@ function ParamChart({
     return { x: PAD_L + (i / 4) * cW, label: new Date(ms).toISOString().slice(11, 19) };
   });
 
+  const resolveColor = (passId: number) =>
+    series.length === 1 && fieldColor ? fieldColor : (passColorMap.get(passId) ?? C.active);
+
   const [hover, setHover] = useState<HoverState | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
 
@@ -137,7 +169,7 @@ function ParamChart({
     if (svgX < PAD_L || svgX > W - PAD_R) { setHover(null); return; }
     const cursorTs = startMs + ((svgX - PAD_L) / cW) * tRange;
     setHover({ svgX, cursorTs, fracX });
-  }, [startMs, tRange, cW]);
+  }, [startMs, tRange, cW, W]);
 
   // Nearest point per series at the hovered timestamp
   const hoverPoints = useMemo(() => {
@@ -150,12 +182,11 @@ function ParamChart({
   }, [hover, series]);
 
   return (
-    <div style={{ position: 'relative' }}>
+    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%' }}>
       <svg
         ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="none"
-        style={{ width: '100%', height: H, display: 'block', cursor: 'crosshair' }}
+        style={{ width: '100%', height: '100%', display: 'block', cursor: 'crosshair' }}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => setHover(null)}
       >
@@ -176,15 +207,10 @@ function ParamChart({
         <line x1={PAD_L} y1={PAD_T}      x2={PAD_L}     y2={PAD_T + cH} stroke={C.borderStrong} strokeWidth="0.6" />
         <line x1={PAD_L} y1={PAD_T + cH} x2={W - PAD_R} y2={PAD_T + cH} stroke={C.borderStrong} strokeWidth="0.6" />
 
-        {/* field label + unit */}
-        <text x={PAD_L + 5} y={PAD_T + 10} fontSize="8.5" fill={C.textMuted} fontFamily="monospace">
-          {field}{unit ? ` (${unit})` : ''}
-        </text>
-
         {/* one polyline per pass */}
         {series.map(({ passId, data }) => {
           if (data.length === 0) return null;
-          const color = passColorMap.get(passId) ?? C.active;
+          const color = resolveColor(passId);
           const pts = data.map(d => `${px(d.ts).toFixed(1)},${py(d.value).toFixed(1)}`).join(' ');
           return <polyline key={passId} points={pts} fill="none" stroke={color} strokeWidth="1.4" />;
         })}
@@ -207,7 +233,7 @@ function ParamChart({
 
         {/* Snap dots at nearest data points */}
         {hover && hoverPoints.map(p => {
-          const color = passColorMap.get(p.passId) ?? C.active;
+          const color = resolveColor(p.passId);
           return (
             <circle
               key={p.passId}
@@ -242,7 +268,7 @@ function ParamChart({
             {new Date(hoverPoints[0].ts).toISOString().slice(11, 23)} UTC
           </div>
           {hoverPoints.map(p => {
-            const color = passColorMap.get(p.passId) ?? C.active;
+            const color = resolveColor(p.passId);
             return (
               <div key={p.passId} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
                 <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: color, flexShrink: 0 }} />
@@ -254,6 +280,47 @@ function ParamChart({
             );
           })}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ── Field row (sidebar) ───────────────────────────────────────────────────────
+
+function FieldRow({ f, i, fieldColorMap, selectedFields, toggleField }: {
+  f: SummaryRow;
+  i: number;
+  fieldColorMap: Map<string, string>;
+  selectedFields: Set<string>;
+  toggleField: (field: string, cmdId: string) => void;
+}) {
+  const checked = selectedFields.has(f.field);
+  const color = fieldColorMap.get(f.field) ?? LINE_COLORS[i % LINE_COLORS.length];
+  return (
+    <div
+      onClick={() => toggleField(f.field, f.cmd_id)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 7,
+        padding: '3px 12px 3px 14px', cursor: 'pointer',
+        backgroundColor: checked ? `${color}10` : 'transparent',
+      }}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = checked ? `${color}1e` : C.bgPanelRaised; }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = checked ? `${color}10` : 'transparent'; }}
+    >
+      <div style={{
+        width: 8, height: 8, borderRadius: 2, flexShrink: 0,
+        backgroundColor: checked ? color : 'transparent',
+        border: `1.5px solid ${checked ? color : C.borderStrong}`,
+      }} />
+      <span style={{
+        fontSize: 10.5, fontFamily: C.fontMono, flex: 1, minWidth: 0,
+        color: checked ? C.textPrimary : C.textMuted,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>{f.field}</span>
+      {f.unit && (
+        <span style={{ fontSize: 8.5, fontFamily: C.fontMono, color: C.textDisabled, flexShrink: 0 }}>
+          {f.unit}
+        </span>
       )}
     </div>
   );
@@ -278,19 +345,32 @@ export function HistoryTab() {
   // Available cmds + fields for selected passes
   const [summary, setSummary] = useState<SummaryRow[]>([]);
 
-  // Active command type
-  const [activeCmd, setActiveCmd] = useState<string | null>(null);
+  // Active command types (multi-select)
+  const [activeCmds, setActiveCmds] = useState<Set<string>>(new Set());
 
-  // Selected fields to plot
-  const [selectedFields, setSelectedFields] = useState<Set<string>>(new Set());
+  // Selected fields to plot — persisted per command so toggling cmds doesn't wipe selections
+  const [fieldSelectionByCmd, setFieldSelectionByCmd] = useState<Map<string, Set<string>>>(new Map());
 
-  // Raw decoded data from server for activeCmd
-  const [historyData, setHistoryData] = useState<DecodedRow[]>([]);
+  // Raw decoded data per command
+  const [historyDataByCmd, setHistoryDataByCmd] = useState<Map<string, DecodedRow[]>>(new Map());
   const [dataLoading, setDataLoading] = useState(false);
 
   // Time range
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
+
+  // Field search
+  const [fieldSearch, setFieldSearch] = useState('');
+
+  // Free-form chart layout
+  const [layoutMap, setLayoutMap] = useState<Map<string, Layout>>(new Map());
+  const chartAreaRef = useRef<HTMLDivElement>(null);
+  const dragRef   = useRef<{ field: string; startMX: number; startMY: number; startX: number; startY: number } | null>(null);
+  const resizeRef = useRef<{
+    field: string; corner: 'tl' | 'tr' | 'bl' | 'br';
+    startMX: number; startMY: number;
+    startX: number; startY: number; startW: number; startH: number;
+  } | null>(null);
 
   // Fetch decode status for all passes when pass list loads
   useEffect(() => {
@@ -304,48 +384,46 @@ export function HistoryTab() {
   // Fetch summary when selectedPassIds changes
   const selectedKey = [...selectedPassIds].sort().join(',');
   useEffect(() => {
-    if (selectedPassIds.size === 0) { setSummary([]); setActiveCmd(null); return; }
+    if (selectedPassIds.size === 0) { setSummary([]); setActiveCmds(new Set()); return; }
     fetch(`/api/history/summary?passIds=${selectedKey}`)
       .then(r => r.json() as Promise<SummaryRow[]>)
       .then(rows => {
         setSummary(rows);
-        // Auto-select first available cmd
+        // Auto-select first available cmd if nothing is active
         const cmds = [...new Set(rows.map(r => r.cmd_id))];
-        setActiveCmd(prev => (prev && cmds.includes(prev) ? prev : cmds[0] ?? null));
+        setActiveCmds(prev => prev.size === 0 && cmds.length > 0 ? new Set([cmds[0]]) : prev);
       })
       .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey]);
 
-  // Fetch data when selectedPassIds or activeCmd changes
+  // Fetch data for all active cmds when passes or active cmds change
+  const activeCmdsKey = [...activeCmds].sort().join(',');
   useEffect(() => {
-    if (selectedPassIds.size === 0 || !activeCmd) { setHistoryData([]); return; }
-    setDataLoading(true);
-    fetch(`/api/history/data?passIds=${selectedKey}&cmd=${encodeURIComponent(activeCmd)}`)
-      .then(r => r.json() as Promise<DecodedRow[]>)
-      .then(rows => {
-        setHistoryData(rows);
-        setDataLoading(false);
-        // Set time range from data if empty
-        const times = rows.map(r => r.ts_ms).filter(t => t > 0);
-        if (times.length > 0 && !rangeStart) {
-          setRangeStart(msToInput(Math.min(...times)));
-          setRangeEnd(msToInput(Math.max(...times)));
-        }
-      })
-      .catch(() => setDataLoading(false));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedKey, activeCmd]);
-
-  // Reset time range when cmd changes
-  const prevCmd = useRef<string | null>(null);
-  useEffect(() => {
-    if (activeCmd !== prevCmd.current) {
-      setRangeStart('');
-      setRangeEnd('');
-      prevCmd.current = activeCmd;
+    if (selectedPassIds.size === 0 || activeCmds.size === 0) {
+      setHistoryDataByCmd(new Map());
+      setDataLoading(false);
+      return;
     }
-  }, [activeCmd]);
+    setDataLoading(true);
+    Promise.all(
+      [...activeCmds].map(cmd =>
+        fetch(`/api/history/data?passIds=${selectedKey}&cmd=${encodeURIComponent(cmd)}`)
+          .then(r => r.json() as Promise<DecodedRow[]>)
+          .then(rows => [cmd, rows] as [string, DecodedRow[]]),
+      ),
+    ).then(results => {
+      const next = new Map(results);
+      setHistoryDataByCmd(next);
+      setDataLoading(false);
+      const allTimes = results.flatMap(([, rows]) => rows.map(r => r.ts_ms)).filter(t => t > 0);
+      if (allTimes.length > 0 && !rangeStart) {
+        setRangeStart(msToInput(Math.min(...allTimes)));
+        setRangeEnd(msToInput(Math.max(...allTimes)));
+      }
+    }).catch(() => setDataLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey, activeCmdsKey]);
 
   // Materialize a single pass
   const materialize = useCallback(async (passId: number) => {
@@ -373,6 +451,12 @@ export function HistoryTab() {
     }
   }, [selectedPassIds]);
 
+  // Combined history data across all active cmds
+  const historyData = useMemo(
+    () => [...historyDataByCmd.values()].flat(),
+    [historyDataByCmd],
+  );
+
   // Effective time range
   const effectiveRange = useMemo(() => {
     const times = historyData.map(r => r.ts_ms).filter(t => t > 0);
@@ -386,10 +470,10 @@ export function HistoryTab() {
   // Available cmds from summary
   const availCmds = useMemo(() => [...new Set(summary.map(r => r.cmd_id))].sort(), [summary]);
 
-  // Available fields for active cmd
+  // Available fields across all active cmds
   const availFields = useMemo(
-    () => summary.filter(r => r.cmd_id === activeCmd),
-    [summary, activeCmd],
+    () => summary.filter(r => activeCmds.has(r.cmd_id)),
+    [summary, activeCmds],
   );
 
   // Color per pass (deterministic by position in allPassIds)
@@ -399,12 +483,22 @@ export function HistoryTab() {
     return m;
   }, [passRows]);
 
-  // Color per field
+  // Color per field — keyed from the full summary list so indices never shift when
+  // categories are toggled on/off.
   const fieldColorMap = useMemo(() => {
     const m = new Map<string, string>();
-    availFields.forEach((f, i) => m.set(f.field, LINE_COLORS[i % LINE_COLORS.length]));
+    summary.forEach((f, i) => m.set(f.field, LINE_COLORS[i % LINE_COLORS.length]));
     return m;
-  }, [availFields]);
+  }, [summary]);
+
+  // Union of all selected fields across active cmds
+  const selectedFields = useMemo(() => {
+    const all = new Set<string>();
+    activeCmds.forEach(cmd => {
+      (fieldSelectionByCmd.get(cmd) ?? new Set<string>()).forEach(f => all.add(f));
+    });
+    return all;
+  }, [fieldSelectionByCmd, activeCmds]);
 
   // Build per-field series data, split by pass
   const seriesData = useMemo(() => {
@@ -424,7 +518,10 @@ export function HistoryTab() {
     return map;
   }, [historyData, selectedFields, effectiveRange]);
 
-  const selectedFieldList = availFields.filter(f => selectedFields.has(f.field));
+  const selectedFieldList = availFields.filter(f => {
+    const cmdFields = fieldSelectionByCmd.get(f.cmd_id) ?? new Set<string>();
+    return cmdFields.has(f.field);
+  });
 
   const togglePass = useCallback((id: number) => {
     setSelectedPassIds(prev => {
@@ -434,13 +531,158 @@ export function HistoryTab() {
     });
   }, []);
 
-  const toggleField = useCallback((field: string) => {
-    setSelectedFields(prev => {
+  const toggleCmd = useCallback((cmd: string) => {
+    setActiveCmds(prev => {
       const next = new Set(prev);
-      if (next.has(field)) next.delete(field); else next.add(field);
+      if (next.has(cmd)) next.delete(cmd); else next.add(cmd);
       return next;
     });
   }, []);
+
+  const toggleField = useCallback((field: string, cmdId: string) => {
+    setFieldSelectionByCmd(prev => {
+      const cur = prev.get(cmdId) ?? new Set<string>();
+      const next = new Set(cur);
+      if (next.has(field)) next.delete(field); else next.add(field);
+      return new Map(prev).set(cmdId, next);
+    });
+  }, []);
+
+  // ── Layout init (assign default positions to newly-selected fields) ─────
+
+  const fieldKey = selectedFieldList.map(f => f.field).join(',');
+  useEffect(() => {
+    const containerW = chartAreaRef.current?.clientWidth ?? 800;
+    const colW = snap(Math.max(CHART_MIN_W, Math.floor((containerW - CHART_PAD * 2 - CHART_GAP) / 2)));
+    setLayoutMap(prev => {
+      const next = new Map(prev);
+      let nextSlot = prev.size;
+      let changed = false;
+      selectedFieldList.forEach(f => {
+        if (!next.has(f.field)) {
+          const col = nextSlot % 2;
+          const row = Math.floor(nextSlot / 2);
+          next.set(f.field, {
+            x: snap(CHART_PAD + col * (colW + CHART_GAP)),
+            y: snap(CHART_PAD + row * (CHART_DEFAULT_H + CHART_GAP)),
+            w: colW,
+            h: CHART_DEFAULT_H,
+          });
+          nextSlot++;
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fieldKey]);
+
+  // ── Drag handler ─────────────────────────────────────────────────────────
+
+  function onHeaderMouseDown(e: React.MouseEvent, field: string) {
+    e.preventDefault();
+    const layout = layoutMap.get(field);
+    if (!layout) return;
+    dragRef.current = { field, startMX: e.clientX, startMY: e.clientY, startX: layout.x, startY: layout.y };
+    document.body.style.cursor = 'grabbing';
+    document.body.style.userSelect = 'none';
+
+    function onMove(ev: MouseEvent) {
+      if (!dragRef.current) return;
+      const { startMX, startMY, startX, startY, field: f } = dragRef.current;
+      const newX = Math.max(0, snap(startX + ev.clientX - startMX));
+      const newY = Math.max(0, snap(startY + ev.clientY - startMY));
+      setLayoutMap(prev => {
+        const cur = prev.get(f);
+        if (!cur) return prev;
+        const next = new Map(prev);
+        next.set(f, { ...cur, x: newX, y: newY });
+        return next;
+      });
+    }
+
+    function onUp() {
+      dragRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  // ── Resize handler ────────────────────────────────────────────────────────
+
+  function onResizeMouseDown(e: React.MouseEvent, field: string, corner: 'tl' | 'tr' | 'bl' | 'br') {
+    e.preventDefault();
+    e.stopPropagation();
+    const layout = layoutMap.get(field);
+    if (!layout) return;
+    const cursorMap = { tl: 'nw-resize', tr: 'ne-resize', bl: 'sw-resize', br: 'se-resize' };
+    resizeRef.current = {
+      field, corner,
+      startMX: e.clientX, startMY: e.clientY,
+      startX: layout.x, startY: layout.y, startW: layout.w, startH: layout.h,
+    };
+    document.body.style.cursor = cursorMap[corner];
+    document.body.style.userSelect = 'none';
+
+    function onMove(ev: MouseEvent) {
+      if (!resizeRef.current) return;
+      const { startMX, startMY, startX, startY, startW, startH, field: f, corner: c } = resizeRef.current;
+      const dx = ev.clientX - startMX;
+      const dy = ev.clientY - startMY;
+      let newX = startX, newY = startY;
+      let newW = startW, newH = startH;
+
+      if (c === 'br') {
+        newW = Math.max(CHART_MIN_W, snap(startW + dx));
+        newH = Math.max(CHART_MIN_H, snap(startH + dy));
+      } else if (c === 'bl') {
+        newW = Math.max(CHART_MIN_W, snap(startW - dx));
+        newX = Math.max(0, snap(startX + startW - newW));
+        newH = Math.max(CHART_MIN_H, snap(startH + dy));
+      } else if (c === 'tr') {
+        newW = Math.max(CHART_MIN_W, snap(startW + dx));
+        newH = Math.max(CHART_MIN_H, snap(startH - dy));
+        newY = Math.max(0, snap(startY + startH - newH));
+      } else {
+        newW = Math.max(CHART_MIN_W, snap(startW - dx));
+        newX = Math.max(0, snap(startX + startW - newW));
+        newH = Math.max(CHART_MIN_H, snap(startH - dy));
+        newY = Math.max(0, snap(startY + startH - newH));
+      }
+
+      setLayoutMap(prev => {
+        const cur = prev.get(f);
+        if (!cur) return prev;
+        const next = new Map(prev);
+        next.set(f, { x: newX, y: newY, w: newW, h: newH });
+        return next;
+      });
+    }
+
+    function onUp() {
+      resizeRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  // ── Canvas height ─────────────────────────────────────────────────────────
+
+  const canvasH = useMemo(() => {
+    let h = 300;
+    layoutMap.forEach(l => { h = Math.max(h, l.y + l.h + CHART_PAD); });
+    return h;
+  }, [layoutMap]);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -572,25 +814,28 @@ export function HistoryTab() {
           {/* Cmd + field selector */}
           {availCmds.length > 0 && (
             <>
-              {/* Cmd tabs */}
+              {/* Cmd toggles (multi-select) */}
               <div style={{
                 padding: '5px 10px', borderTop: `1px solid ${C.borderStrong}`,
                 borderBottom: `1px solid ${C.borderSubtle}`, flexShrink: 0,
                 display: 'flex', gap: 4, flexWrap: 'wrap', backgroundColor: C.bgApp,
               }}>
-                {availCmds.map(cmd => (
-                  <button
-                    key={cmd}
-                    onClick={() => { setActiveCmd(cmd); setSelectedFields(new Set()); }}
-                    style={{
-                      padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
-                      fontSize: 9.5, fontFamily: C.fontMono,
-                      backgroundColor: cmd === activeCmd ? C.activeFill : 'transparent',
-                      color: cmd === activeCmd ? C.active : C.textMuted,
-                      border: `1px solid ${cmd === activeCmd ? `${C.active}44` : C.borderSubtle}`,
-                    }}
-                  >{cmd}</button>
-                ))}
+                {availCmds.map(cmd => {
+                  const on = activeCmds.has(cmd);
+                  return (
+                    <button
+                      key={cmd}
+                      onClick={() => toggleCmd(cmd)}
+                      style={{
+                        padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
+                        fontSize: 9.5, fontFamily: C.fontMono,
+                        backgroundColor: on ? C.activeFill : 'transparent',
+                        color: on ? C.active : C.textMuted,
+                        border: `1px solid ${on ? `${C.active}44` : C.borderSubtle}`,
+                      }}
+                    >{cmd}</button>
+                  );
+                })}
               </div>
 
               {/* Field header */}
@@ -602,146 +847,290 @@ export function HistoryTab() {
                   fields
                 </span>
                 <div style={{ display: 'flex', gap: 5 }}>
-                  <button onClick={() => setSelectedFields(new Set(availFields.map(f => f.field)))} style={microBtnStyle()}>all</button>
-                  <button onClick={() => setSelectedFields(new Set())} style={microBtnStyle()}>none</button>
+                  <button onClick={() => {
+                    setFieldSelectionByCmd(prev => {
+                      const next = new Map(prev);
+                      activeCmds.forEach(cmd => {
+                        next.set(cmd, new Set(availFields.filter(f => f.cmd_id === cmd).map(f => f.field)));
+                      });
+                      return next;
+                    });
+                  }} style={microBtnStyle()}>all</button>
+                  <button onClick={() => {
+                    setFieldSelectionByCmd(prev => {
+                      const next = new Map(prev);
+                      activeCmds.forEach(cmd => next.set(cmd, new Set()));
+                      return next;
+                    });
+                  }} style={microBtnStyle()}>none</button>
                 </div>
               </div>
 
-              {/* Field checkboxes */}
+              {/* Field search */}
+              <div style={{ padding: '4px 10px', borderBottom: `1px solid ${C.borderSubtle}`, flexShrink: 0 }}>
+                <input
+                  type="text"
+                  placeholder="search fields…"
+                  value={fieldSearch}
+                  onChange={e => setFieldSearch(e.target.value)}
+                  style={{
+                    width: '100%', boxSizing: 'border-box',
+                    fontFamily: C.fontMono, fontSize: 10.5, color: C.textPrimary,
+                    backgroundColor: C.bgApp, border: `1px solid ${C.borderSubtle}`,
+                    borderRadius: 3, padding: '3px 7px', outline: 'none',
+                  }}
+                />
+              </div>
+
+              {/* Field checkboxes — grouped by cmd when multiple active */}
               <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-                {availFields.map((f, i) => {
-                  const checked = selectedFields.has(f.field);
-                  const color = LINE_COLORS[i % LINE_COLORS.length];
-                  return (
-                    <div
-                      key={f.field}
-                      onClick={() => toggleField(f.field)}
-                      style={{
-                        display: 'flex', alignItems: 'center', gap: 7,
-                        padding: '3px 12px 3px 14px', cursor: 'pointer',
-                        backgroundColor: checked ? `${color}10` : 'transparent',
-                      }}
-                      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = checked ? `${color}1e` : C.bgPanelRaised; }}
-                      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = checked ? `${color}10` : 'transparent'; }}
-                    >
-                      <div style={{
-                        width: 8, height: 8, borderRadius: 2, flexShrink: 0,
-                        backgroundColor: checked ? color : 'transparent',
-                        border: `1.5px solid ${checked ? color : C.borderStrong}`,
-                      }} />
-                      <span style={{
-                        fontSize: 10.5, fontFamily: C.fontMono, flex: 1, minWidth: 0,
-                        color: checked ? C.textPrimary : C.textMuted,
-                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      }}>{f.field}</span>
-                      {f.unit && (
-                        <span style={{ fontSize: 8.5, fontFamily: C.fontMono, color: C.textDisabled, flexShrink: 0 }}>
-                          {f.unit}
-                        </span>
-                      )}
+                {(() => {
+                  const q = fieldSearch.trim().toLowerCase();
+                  const filtered = q
+                    ? availFields.filter(f => f.field.toLowerCase().includes(q))
+                    : availFields;
+                  if (filtered.length === 0) return (
+                    <div style={{ padding: '10px 14px', fontSize: 10, fontFamily: C.fontMono, color: C.textDisabled }}>
+                      no matches
                     </div>
                   );
-                })}
+                  if (activeCmds.size > 1 && !q) {
+                    return [...activeCmds].sort().map(cmd => {
+                      const cmdFields = filtered.filter(f => f.cmd_id === cmd);
+                      if (cmdFields.length === 0) return null;
+                      return (
+                        <div key={cmd}>
+                          <div style={{
+                            padding: '3px 12px', fontSize: 8.5, fontFamily: C.fontMono,
+                            color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.08em',
+                            backgroundColor: C.bgApp, borderBottom: `1px solid ${C.borderSubtle}`,
+                          }}>{cmd}</div>
+                          {cmdFields.map((f, i) => <FieldRow key={f.cmd_id + ':' + f.field} f={f} i={i} fieldColorMap={fieldColorMap} selectedFields={selectedFields} toggleField={toggleField} />)}
+                        </div>
+                      );
+                    });
+                  }
+                  return filtered.map((f, i) => (
+                    <FieldRow key={f.cmd_id + ':' + f.field} f={f} i={i} fieldColorMap={fieldColorMap} selectedFields={selectedFields} toggleField={toggleField} />
+                  ));
+                })()}
               </div>
             </>
           )}
         </div>
 
         {/* Chart area */}
-        <div style={{ flex: 1, overflow: 'auto', minWidth: 0, backgroundColor: C.bgApp }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
 
-          {/* Pass color legend (when >1 pass selected) */}
-          {selectedPassIds.size > 1 && hasData && (
+          {/* Always-visible selected fields strip */}
+          {availCmds.length > 0 && (
             <div style={{
-              display: 'flex', flexWrap: 'wrap', gap: '4px 14px',
-              padding: '6px 14px', borderBottom: `1px solid ${C.borderSubtle}`,
+              display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '4px 8px',
+              padding: '5px 12px', borderBottom: `1px solid ${C.borderSubtle}`,
               backgroundColor: C.bgPanel, flexShrink: 0,
             }}>
-              {passRows.filter(p => selectedPassIds.has(Number(p.pass_id))).map(p => {
-                const id = Number(p.pass_id);
-                const color = passColorMap.get(id) ?? C.active;
-                return (
-                  <span key={id} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                    <div style={{ width: 16, height: 2, backgroundColor: color, borderRadius: 1 }} />
-                    <span style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled }}>
-                      {p.session_id || `pass_${id}`} ({p.pass_date})
+              <span style={{ fontSize: 9, fontFamily: C.fontMono, color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.1em', flexShrink: 0, marginRight: 2 }}>
+                plotting
+              </span>
+              {selectedFields.size === 0 ? (
+                <span style={{ fontSize: 10, fontFamily: C.fontMono, color: C.textDisabled }}>
+                  no fields selected — pick from sidebar
+                </span>
+              ) : (
+                [...selectedFields].map(field => {
+                  const color = fieldColorMap.get(field) ?? C.active;
+                  const info = availFields.find(f => f.field === field);
+                  return (
+                    <span
+                      key={field}
+                      onClick={() => info && toggleField(field, info.cmd_id)}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 5,
+                        padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
+                        backgroundColor: `${color}18`,
+                        border: `1px solid ${color}55`,
+                        fontSize: 10.5, fontFamily: C.fontMono, color,
+                        userSelect: 'none',
+                      }}
+                    >
+                      <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: color, flexShrink: 0 }} />
+                      {field}{info?.unit ? ` (${info.unit})` : ''}
+                      <span style={{ opacity: 0.45, fontSize: 10, marginLeft: 1 }}>×</span>
                     </span>
-                  </span>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
           )}
 
-          {/* Empty state */}
-          {selectedPassIds.size === 0 && (
-            <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
-              select passes from the sidebar to begin
-            </div>
-          )}
+          {/* Scrollable content */}
+          <div style={{ flex: 1, overflow: 'auto', minWidth: 0, backgroundColor: C.bgApp }}>
 
-          {selectedPassIds.size > 0 && !hasData && !dataLoading && (
-            <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
-              {availCmds.length === 0
-                ? 'no decoded telemetry — click Decode on the passes in the sidebar'
-                : 'select fields to plot'}
-            </div>
-          )}
+            {/* Pass color legend (when >1 pass selected) */}
+            {selectedPassIds.size > 1 && hasData && (
+              <div style={{
+                display: 'flex', flexWrap: 'wrap', gap: '4px 14px',
+                padding: '6px 14px', borderBottom: `1px solid ${C.borderSubtle}`,
+                backgroundColor: C.bgPanel, flexShrink: 0,
+              }}>
+                {passRows.filter(p => selectedPassIds.has(Number(p.pass_id))).map(p => {
+                  const id = Number(p.pass_id);
+                  const color = passColorMap.get(id) ?? C.active;
+                  return (
+                    <span key={id} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                      <div style={{ width: 16, height: 2, backgroundColor: color, borderRadius: 1 }} />
+                      <span style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled }}>
+                        {p.session_id || `pass_${id}`} ({p.pass_date})
+                      </span>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
 
-          {dataLoading && (
-            <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
-              <span style={{ color: C.active }}>⟳</span>&nbsp;loading…
-            </div>
-          )}
+            {/* Empty state */}
+            {selectedPassIds.size === 0 && (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
+                select passes from the sidebar to begin
+              </div>
+            )}
 
-          {!dataLoading && hasData && selectedFieldList.length === 0 && (
-            <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
-              select fields from the sidebar to plot
-            </div>
-          )}
+            {selectedPassIds.size > 0 && !hasData && !dataLoading && (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
+                {availCmds.length === 0
+                  ? 'no decoded telemetry — click Decode on the passes in the sidebar'
+                  : activeCmds.size === 0
+                  ? 'select a telemetry category from the sidebar'
+                  : 'select fields to plot'}
+              </div>
+            )}
 
-          {/* Charts — 2-column grid */}
-          {!dataLoading && selectedFieldList.length > 0 && (
-            <div style={{
-              padding: '10px 12px',
-              display: 'grid',
-              gridTemplateColumns: '1fr 1fr',
-              gap: 4,
-            }}>
-              {selectedFieldList.map((f) => {
-                const byPass = seriesData.get(f.field);
-                const seriesArr = byPass
-                  ? [...selectedPassIds].map(id => ({ passId: id, data: byPass.get(id) ?? [] }))
-                  : [];
-                const totalPts = seriesArr.reduce((s, x) => s + x.data.length, 0);
-                return (
-                  <div key={f.field} style={{
-                    backgroundColor: C.bgPanel,
+            {/* Full-screen spinner only when there are no charts to show yet */}
+            {dataLoading && selectedFieldList.length === 0 && (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
+                <span style={{ color: C.active }}>⟳</span>&nbsp;loading…
+              </div>
+            )}
+
+            {!dataLoading && hasData && selectedFieldList.length === 0 && (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: C.textDisabled, fontSize: 12, fontFamily: C.fontMono }}>
+                select fields from the sidebar to plot
+              </div>
+            )}
+
+            {/* Charts — keep mounted during loading so cards/ResizeObservers don't reset */}
+            {selectedFieldList.length > 0 && (
+              <div ref={chartAreaRef} style={{ position: 'relative', height: canvasH }}>
+                {/* Inline loading badge — doesn't unmount the canvas */}
+                {dataLoading && (
+                  <div style={{
+                    position: 'absolute', top: 8, right: 12, zIndex: 20,
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    backgroundColor: 'rgba(10,10,14,0.82)',
                     border: `1px solid ${C.borderSubtle}`,
-                    borderRadius: 3, overflow: 'hidden',
+                    borderRadius: 4, padding: '3px 8px',
+                    fontSize: 10, fontFamily: C.fontMono, color: C.textDisabled,
                   }}>
-                    {totalPts === 0 ? (
-                      <div style={{
-                        height: 78, display: 'flex', alignItems: 'center', padding: '0 14px',
-                        fontFamily: C.fontMono, fontSize: 10, color: C.textDisabled,
-                      }}>
-                        {f.field}{f.unit ? ` (${f.unit})` : ''} — no numeric data in range
-                      </div>
-                    ) : (
-                      <ParamChart
-                        field={f.field}
-                        unit={f.unit}
-                        series={seriesArr}
-                        passColorMap={passColorMap}
-                        startMs={effectiveRange.start}
-                        endMs={effectiveRange.end}
-                        showXAxis={true}
-                      />
-                    )}
+                    <span style={{ color: C.active }}>⟳</span> loading…
                   </div>
-                );
-              })}
-            </div>
-          )}
+                )}
+                {selectedFieldList.map((f) => {
+                  const layout = layoutMap.get(f.field);
+                  if (!layout) return null;
+                  const byPass = seriesData.get(f.field);
+                  const seriesArr = byPass
+                    ? [...selectedPassIds].map(id => ({ passId: id, data: byPass.get(id) ?? [] }))
+                    : [];
+                  const totalPts = seriesArr.reduce((s, x) => s + x.data.length, 0);
+                  const fieldColor = fieldColorMap.get(f.field) ?? C.active;
+                  return (
+                    <div
+                      key={f.field}
+                      style={{
+                        position: 'absolute',
+                        left: layout.x, top: layout.y,
+                        width: layout.w, height: layout.h,
+                        backgroundColor: C.bgPanel,
+                        border: `1px solid ${C.borderSubtle}`,
+                        borderRadius: 4,
+                        overflow: 'hidden',
+                        display: 'flex', flexDirection: 'column',
+                        boxSizing: 'border-box',
+                      }}
+                    >
+                      {/* Header — drag handle */}
+                      <div
+                        style={{
+                          padding: '5px 10px',
+                          borderBottom: `1px solid ${C.borderSubtle}`,
+                          display: 'flex', alignItems: 'center', gap: 7,
+                          backgroundColor: `${fieldColor}0d`,
+                          cursor: 'grab', flexShrink: 0, userSelect: 'none',
+                        }}
+                        onMouseDown={(e) => onHeaderMouseDown(e, f.field)}
+                      >
+                        <div style={{ width: 10, height: 10, borderRadius: 2, backgroundColor: fieldColor, flexShrink: 0 }} />
+                        <span style={{ fontSize: 12, fontFamily: C.fontMono, color: C.textPrimary }}>
+                          {f.field}
+                        </span>
+                        {f.unit && (
+                          <span style={{ fontSize: 10, fontFamily: C.fontMono, color: C.textDisabled }}>
+                            {f.unit}
+                          </span>
+                        )}
+                        <div style={{ flex: 1 }} />
+                        {totalPts === 0 && (
+                          <span style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled }}>
+                            no numeric data in range
+                          </span>
+                        )}
+                        <span style={{ fontSize: 11, color: C.textDisabled, opacity: 0.4, marginLeft: 6 }}>⠿</span>
+                      </div>
+
+                      {/* Chart body — fills remaining height */}
+                      <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
+                        {totalPts > 0 && (
+                          <ParamChart
+                            field={f.field}
+                            unit={f.unit}
+                            series={seriesArr}
+                            passColorMap={passColorMap}
+                            fieldColor={fieldColor}
+                            startMs={effectiveRange.start}
+                            endMs={effectiveRange.end}
+                            showXAxis={true}
+                          />
+                        )}
+                        {totalPts === 0 && <div style={{ height: '100%' }} />}
+                      </div>
+
+                      {/* Corner resize handles */}
+                      {([
+                        { corner: 'tl', top: 0,    left: 0,   right: undefined, bottom: undefined, borderRadius: '4px 0 0 0', cursor: 'nw-resize', borderTop: true,  borderLeft: true,  borderRight: false, borderBottom: false },
+                        { corner: 'tr', top: 0,    left: undefined, right: 0,   bottom: undefined, borderRadius: '0 4px 0 0', cursor: 'ne-resize', borderTop: true,  borderLeft: false, borderRight: true,  borderBottom: false },
+                        { corner: 'bl', top: undefined, left: 0,   right: undefined, bottom: 0,   borderRadius: '0 0 0 4px', cursor: 'sw-resize', borderTop: false, borderLeft: true,  borderRight: false, borderBottom: true  },
+                        { corner: 'br', top: undefined, left: undefined, right: 0, bottom: 0,     borderRadius: '0 0 4px 0', cursor: 'se-resize', borderTop: false, borderLeft: false, borderRight: true,  borderBottom: true  },
+                      ] as const).map(({ corner, top, left, right, bottom, borderRadius, cursor, borderTop: bT, borderLeft: bL, borderRight: bR, borderBottom: bB }) => (
+                        <div
+                          key={corner}
+                          style={{
+                            position: 'absolute', top, left, right, bottom,
+                            width: 14, height: 14, cursor, zIndex: 2, opacity: 0.55,
+                            borderTop:    bT ? `3px solid ${C.borderStrong}` : undefined,
+                            borderLeft:   bL ? `3px solid ${C.borderStrong}` : undefined,
+                            borderRight:  bR ? `3px solid ${C.borderStrong}` : undefined,
+                            borderBottom: bB ? `3px solid ${C.borderStrong}` : undefined,
+                            borderRadius,
+                          }}
+                          onMouseDown={(e) => onResizeMouseDown(e, f.field, corner)}
+                        />
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

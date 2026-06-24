@@ -53,7 +53,11 @@ const EVENT_KIND_LABELS: Record<string, string> = {
 
 /* ─── main component ─────────────────────────────────────────────────────── */
 
-export function IngestPage() {
+interface IngestPageProps {
+  onIngestComplete?: () => void;
+}
+
+export function IngestPage({ onIngestComplete }: IngestPageProps) {
   const [phase, setPhase]       = useState<Phase>('idle');
   const [file, setFile]         = useState<File | null>(null);
   const [preview, setPreview]   = useState<{ lines: number; kinds: Record<string, number> } | null>(null);
@@ -133,6 +137,7 @@ export function IngestPage() {
       } else {
         setResult(data);
         setPhase('done');
+        onIngestComplete?.();
       }
     } catch (err) {
       setError(String(err));

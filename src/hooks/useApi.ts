@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import type { AppSchema, Row } from '../types';
 
-export function useSchema() {
+export function useSchema(refreshKey = 0) {
   const [schema, setSchema] = useState<AppSchema | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -13,7 +13,8 @@ export function useSchema() {
       })
       .then(setSchema)
       .catch((e: unknown) => setError(String(e)));
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   return { schema, error };
 }

@@ -17,6 +17,7 @@ export interface TableMeta {
   desc: string;
   primary: string;
   rows: number;
+  sourceFile?: string;
 }
 
 export interface SchemaGroup {
