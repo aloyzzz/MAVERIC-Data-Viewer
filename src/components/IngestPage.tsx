@@ -3,15 +3,27 @@ import { C } from '../lib/colors';
 
 /* ─── types ──────────────────────────────────────────────────────────────── */
 
+interface DuplicateInfo {
+  passId: number;
+  sessionId: string;
+  sourceFile: string;
+}
+
 interface IngestResult {
   passId: number;
   sessionId: string;
   counts: Record<string, number>;
   skipped: number;
   warnings: string[];
+  duplicateOf?: DuplicateInfo;
 }
 
 type Phase = 'idle' | 'ready' | 'confirm' | 'ingesting' | 'done' | 'error';
+
+async function sha256Hex(text: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
 /* ─── shared styles ──────────────────────────────────────────────────────── */
 
@@ -58,20 +70,22 @@ interface IngestPageProps {
 }
 
 export function IngestPage({ onIngestComplete }: IngestPageProps) {
-  const [phase, setPhase]       = useState<Phase>('idle');
-  const [file, setFile]         = useState<File | null>(null);
-  const [preview, setPreview]   = useState<{ lines: number; kinds: Record<string, number> } | null>(null);
-  const [result, setResult]     = useState<IngestResult | null>(null);
-  const [error, setError]       = useState<string | null>(null);
-  const [dragging, setDragging] = useState(false);
+  const [phase, setPhase]             = useState<Phase>('idle');
+  const [file, setFile]               = useState<File | null>(null);
+  const [preview, setPreview]         = useState<{ lines: number; kinds: Record<string, number> } | null>(null);
+  const [result, setResult]           = useState<IngestResult | null>(null);
+  const [error, setError]             = useState<string | null>(null);
+  const [dragging, setDragging]       = useState(false);
   const [passIdInput, setPassIdInput] = useState('');
+  const [duplicateWarning, setDuplicateWarning] = useState<DuplicateInfo | null>(null);
   const passIdRef = useRef<HTMLInputElement>(null);
   const inputRef  = useRef<HTMLInputElement>(null);
 
   /* parse a quick preview of the file without sending it yet */
   const parsePreview = useCallback((f: File) => {
+    setDuplicateWarning(null);
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       const text = e.target?.result as string;
       const lines = text.split('\n').filter((l) => l.trim());
       const kinds: Record<string, number> = {};
@@ -83,6 +97,12 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
         } catch { /* skip */ }
       }
       setPreview({ lines: lines.length, kinds });
+      try {
+        const hash = await sha256Hex(text);
+        const res = await fetch(`/api/ingest/check?hash=${hash}`);
+        const data = await res.json() as { duplicate: DuplicateInfo | null };
+        setDuplicateWarning(data.duplicate);
+      } catch { /* non-fatal */ }
     };
     reader.readAsText(f);
   }, []);
@@ -93,6 +113,7 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
     setResult(null);
     setError(null);
     setPreview(null);
+    setDuplicateWarning(null);
     parsePreview(f);
   }, [parsePreview]);
 
@@ -153,6 +174,7 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
     setPreview(null);
     setResult(null);
     setError(null);
+    setDuplicateWarning(null);
     if (inputRef.current) inputRef.current.value = '';
   };
 
@@ -240,6 +262,29 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
           )}
         </div>
 
+        {/* ── duplicate warning ── */}
+        {duplicateWarning && (phase === 'ready' || phase === 'ingesting') && (
+          <div style={{
+            backgroundColor: `${C.warning}12`,
+            border: `1px solid ${C.warning}66`,
+            borderRadius: 4, padding: '10px 16px',
+            display: 'flex', alignItems: 'flex-start', gap: 10,
+          }}>
+            <span style={{ fontSize: 14, color: C.warning, flexShrink: 0, lineHeight: 1.2 }}>!</span>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              <span style={{ fontSize: 11.5, ...mono, color: C.warning, fontWeight: 600 }}>
+                Duplicate file detected
+              </span>
+              <span style={{ fontSize: 10.5, ...mono, color: C.textMuted }}>
+                This file was already ingested as pass_id {duplicateWarning.passId}
+                {duplicateWarning.sessionId ? ` (${duplicateWarning.sessionId})` : ''}
+                {duplicateWarning.sourceFile ? ` from ${duplicateWarning.sourceFile}` : ''}.
+                {' '}Ingesting again will create a new duplicate pass.
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* ── preview breakdown ── */}
         {preview && (phase === 'ready' || phase === 'ingesting') && (
           <div style={{
@@ -306,6 +351,22 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
                   </div>
                 ))}
               </div>
+
+              {result.duplicateOf && (
+                <>
+                  <div style={{ height: 1, backgroundColor: C.borderSubtle }} />
+                  <div style={{
+                    backgroundColor: `${C.warning}12`,
+                    border: `1px solid ${C.warning}55`,
+                    borderRadius: 3, padding: '8px 12px',
+                    fontSize: 10.5, ...mono, color: C.warning,
+                  }}>
+                    This file was previously ingested as pass_id {result.duplicateOf.passId}
+                    {result.duplicateOf.sessionId ? ` (${result.duplicateOf.sessionId})` : ''}.
+                    A new duplicate pass was created.
+                  </div>
+                </>
+              )}
 
               {result.warnings.length > 0 && (
                 <>
@@ -375,7 +436,6 @@ export function IngestPage({ onIngestComplete }: IngestPageProps) {
             </span>
           )}
         </div>
-
       </div>
     </div>
 

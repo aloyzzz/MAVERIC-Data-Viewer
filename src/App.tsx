@@ -4,6 +4,8 @@ import { useSchema } from './hooks/useApi';
 import { MiniHeader } from './components/MiniHeader';
 import { HintBar } from './components/HintBar';
 import { VariationA } from './layouts/VariationA';
+import { TimezoneProvider } from './lib/timezone';
+import { SettingsProvider } from './lib/settings';
 
 export function App() {
   const [refreshKey, setRefreshKey] = useState(0);
@@ -41,18 +43,22 @@ export function App() {
   }
 
   return (
-    <div style={{
-      width: '100%', height: '100%',
-      display: 'flex', flexDirection: 'column',
-      backgroundColor: C.bgApp,
-      fontFamily: C.fontSans,
-      color: C.textPrimary,
-      overflow: 'hidden',
-      position: 'relative',
-    }}>
-      <MiniHeader />
-      <VariationA schema={schema} onSchemaRefresh={refreshSchema} />
-      <HintBar />
-    </div>
+    <SettingsProvider>
+    <TimezoneProvider>
+      <div style={{
+        width: '100%', height: '100%',
+        display: 'flex', flexDirection: 'column',
+        backgroundColor: C.bgApp,
+        fontFamily: C.fontSans,
+        color: C.textPrimary,
+        overflow: 'hidden',
+        position: 'relative',
+      }}>
+        <MiniHeader />
+        <VariationA schema={schema} onSchemaRefresh={refreshSchema} />
+        <HintBar />
+      </div>
+    </TimezoneProvider>
+    </SettingsProvider>
   );
 }

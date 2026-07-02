@@ -1,5 +1,6 @@
 import { useMemo, CSSProperties } from 'react';
 import { C, toneColor, toneFill, toneOf } from '../lib/colors';
+import { useTz, fmtMs as tzFmtMs } from '../lib/timezone';
 import type { AppSchema } from '../types';
 import { useTableRows } from '../hooks/useApi';
 
@@ -14,11 +15,6 @@ interface DashboardProps {
 
 function fmt(n: number) { return n.toLocaleString(); }
 
-function fmtMs(ms: number) {
-  const d = new Date(ms);
-  return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-}
-
 function fmtDuration(ms: number) {
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
@@ -26,10 +22,6 @@ function fmtDuration(ms: number) {
   const s = totalSec % 60;
   if (h > 0) return `${h}h ${m}m ${s}s`;
   return `${m}m ${s}s`;
-}
-
-function fmtTimeOfDay(ms: number) {
-  return new Date(ms).toISOString().slice(11, 19) + ' UTC';
 }
 
 /* ─── sub-components ─────────────────────────────────────────────────────── */
@@ -126,6 +118,7 @@ function ActivityChart({
   rxBins: number[]; txBins: number[]; alarmBins: number[];
   bins: number; startMs: number; binMs: number;
 }) {
+  const { tz } = useTz();
   const W = 800; const H = 90; const PAD_L = 28; const PAD_B = 18;
   const chartW = W - PAD_L;
   const chartH = H - PAD_B;
@@ -159,7 +152,7 @@ function ActivityChart({
   // x-axis time labels (6 ticks)
   const xLabels = Array.from({ length: 7 }, (_, i) => {
     const ms = startMs + (i / 6) * bins * binMs;
-    return { x: PAD_L + (i / 6) * chartW, label: fmtTimeOfDay(ms) };
+    return { x: PAD_L + (i / 6) * chartW, label: tzFmtMs(ms, tz).slice(11, 19) + ' ' + tz };
   });
 
   // y-axis gridlines (3 levels)
@@ -234,6 +227,7 @@ function ActivityChart({
 /* ─── main dashboard ─────────────────────────────────────────────────────── */
 
 export function Dashboard({ schema, onNavigate }: DashboardProps) {
+  const { tz } = useTz();
   const { rows: passRows, loading: lPass } = useTableRows('passes', 10000);
 
   /* ── pick latest pass by pass_id ── */
@@ -454,8 +448,8 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
             { k: 'operator', v: pass ? String(pass['operator']  ?? '—') : '—' },
             { k: 'station',  v: pass ? String(pass['station']   ?? '—') : '—' },
             { k: 'duration', v: duration ? fmtDuration(duration.ms) : '—' },
-            { k: 'start',    v: duration ? fmtTimeOfDay(duration.start) : '—' },
-            { k: 'end',      v: duration ? fmtTimeOfDay(duration.end)   : '—' },
+            { k: 'start',    v: duration ? tzFmtMs(duration.start, tz) : '—' },
+            { k: 'end',      v: duration ? tzFmtMs(duration.end,   tz) : '—' },
           ].map(({ k, v }) => (
             <div key={k} style={{ display: 'flex', flexDirection: 'column', gap: 3, marginRight: 28 }}>
               <span style={{ fontSize: 9, fontFamily: C.fontMono, textTransform: 'uppercase', letterSpacing: '0.1em', color: C.textDisabled }}>
@@ -590,7 +584,7 @@ export function Dashboard({ schema, onNavigate }: DashboardProps) {
 
                     {/* timestamp */}
                     <span style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled, flexShrink: 0, width: 80 }}>
-                      {fmtTimeOfDay(ev.ts)}
+                      {tzFmtMs(ev.ts, tz).slice(11, 19) + ' ' + tz}
                     </span>
 
                     {/* label */}

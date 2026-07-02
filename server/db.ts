@@ -1,8 +1,10 @@
 import { Pool, types, type PoolClient } from 'pg';
-import { mkdirSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { mkdirSync, writeFileSync, existsSync, readdirSync, statSync, rmSync } from 'fs';
 import { resolve, join } from 'path';
+import { createHash } from 'crypto';
 import type { ColumnDef, ColumnType, AppSchema, TableMeta } from '../src/types.js';
 import { decodeRow, parseInnerHex } from './telemetryDecode.js';
+import { getCatalogParameterRows } from './missionCatalog.js';
 
 // node-postgres returns BIGINT (int8, OID 20) as a string by default to avoid
 // precision loss. Every BIGINT column here holds an epoch-millisecond timestamp,
@@ -150,6 +152,7 @@ function inferType(colName: string, pgType: string): ColumnType {
   if (n === 'ts_iso' || n.endsWith('_iso') || n === 'pass_date' || n === 'pass_time') return 'time';
   if (n.endsWith('_ms') || n === 'value_unix_ms') return 'int';
   if (t === 'integer' || t === 'bigint' || t === 'smallint' || t === 'numeric') return 'int';
+  if (t === 'double precision' || t === 'real') return 'float';
   if (n === 'frame_type' || n === 'frame_label') return 'frame';
   if (n === 'event_kind') return 'tag';
   if (['alarm_severity', 'alarm_state', 'alarm_prev_state', 'alarm_prev_severity',
@@ -212,9 +215,11 @@ export async function initDb(): Promise<void> {
         mission_id     TEXT,
         operator       TEXT,
         station        TEXT,
-        schema_version TEXT
+        schema_version TEXT,
+        content_hash   TEXT
       )
     `);
+    await client.query(`ALTER TABLE passes ADD COLUMN IF NOT EXISTS content_hash TEXT`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS decoded_telemetry (
@@ -230,17 +235,78 @@ export async function initDb(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_dt_pass_cmd ON decoded_telemetry (pass_id, cmd_id);
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS satellite_values (
+        id              SERIAL PRIMARY KEY,
+        pass_id         INTEGER NOT NULL,
+        session_id      TEXT,
+        source_event_id TEXT NOT NULL,
+        source_kind     TEXT NOT NULL,
+        ts_ms           BIGINT NOT NULL,
+        ts_iso          TEXT,
+        cmd_id          TEXT,
+        ptype           TEXT,
+        src             TEXT,
+        dest            TEXT,
+        domain          TEXT,
+        parameter_name  TEXT NOT NULL,
+        field_path      TEXT NOT NULL,
+        display_name    TEXT,
+        unit            TEXT NOT NULL DEFAULT '',
+        value_text      TEXT,
+        value_numeric   DOUBLE PRECISION,
+        value_json      JSONB,
+        decoded_ok      TEXT,
+        decode_error    TEXT,
+        raw_hex         TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_sv_pass_ts      ON satellite_values (pass_id, ts_ms);
+      CREATE INDEX IF NOT EXISTS idx_sv_param_ts     ON satellite_values (parameter_name, ts_ms);
+      CREATE INDEX IF NOT EXISTS idx_sv_cmd_ptype    ON satellite_values (cmd_id, ptype);
+      CREATE INDEX IF NOT EXISTS idx_sv_domain_param ON satellite_values (domain, parameter_name);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_unique_value
+        ON satellite_values (pass_id, source_event_id, source_kind, cmd_id, field_path);
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pass_files (
+        id           SERIAL PRIMARY KEY,
+        pass_id      INTEGER NOT NULL,
+        table_id     TEXT NOT NULL,
+        filename     TEXT NOT NULL,
+        file_kind    TEXT NOT NULL,
+        mime_type    TEXT,
+        relative_path TEXT NOT NULL,
+        download_url TEXT NOT NULL,
+        total_bytes  BIGINT NOT NULL DEFAULT 0,
+        chunk_count  INTEGER NOT NULL DEFAULT 0,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_pf_pass ON pass_files (pass_id);
+      CREATE INDEX IF NOT EXISTS idx_pf_kind ON pass_files (file_kind);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_pf_unique
+        ON pass_files (pass_id, file_kind, filename);
+    `);
+
     // Backfill any passes that have no decoded rows yet, and ensure each
     // per-pass table has a ts_ms index (the default sort column).
     const allPasses = (await client.query('SELECT pass_id FROM passes')).rows as { pass_id: number }[];
+    await indexExistingPassFiles(client, allPasses.map(p => p.pass_id));
     const decodedRes = await client.query('SELECT DISTINCT pass_id FROM decoded_telemetry');
     const decodedSet = new Set((decodedRes.rows as { pass_id: number }[]).map(r => r.pass_id));
+    const valuesRes = await client.query('SELECT DISTINCT pass_id FROM satellite_values');
+    const valuesSet = new Set((valuesRes.rows as { pass_id: number }[]).map(r => r.pass_id));
     for (const { pass_id } of allPasses) {
       const tbl = `pass_${pass_id}`;
       if (await tableExists(client, tbl)) {
         await client.query(`CREATE INDEX IF NOT EXISTS "idx_${tbl}_ts_ms" ON "${tbl}" (ts_ms)`);
         if (!decodedSet.has(pass_id)) {
           try { await materializeTelemetry(pass_id); } catch { /* skip */ }
+        }
+        if (!valuesSet.has(pass_id)) {
+          try { await materializeSatelliteValues(pass_id); } catch { /* skip */ }
         }
       }
     }
@@ -417,29 +483,61 @@ export interface ParameterRow {
   name: string;
   value: string;
   unit: string;
+  source?: string;
+  cmd_id?: string;
+  domain?: string;
+  type?: string;
 }
 
 export async function fetchAllParameters(): Promise<ParameterRow[]> {
   const client = await pool.connect();
   try {
-    const tablesRes = await client.query<{ name: string }>(`
-      SELECT table_name AS name
-      FROM information_schema.tables
-      WHERE table_schema = 'public'
-        AND table_type = 'BASE TABLE'
-        AND table_name ~ '^pass_[0-9]+$'
-      ORDER BY table_name
-    `);
-
     const results: ParameterRow[] = [];
-    for (const { name } of tablesRes.rows) {
-      const passId = parseInt(name.slice(5), 10);
-      const res = await client.query<{ ts_ms: number; ts_iso: string; name: string; value: string; unit: string }>(
-        `SELECT ts_ms, ts_iso, name, value, unit FROM "${name}" WHERE event_kind = 'parameter' ORDER BY ts_ms`,
-      );
-      for (const r of res.rows) {
-        results.push({ pass_id: passId, ts_ms: r.ts_ms, ts_iso: r.ts_iso, name: r.name ?? '', value: r.value ?? '', unit: r.unit ?? '' });
-      }
+    const seenNames = new Set<string>();
+    const observed = await client.query<{
+      pass_id: number;
+      ts_ms: number;
+      ts_iso: string;
+      parameter_name: string;
+      field_path: string;
+      value_text: string;
+      unit: string;
+      source_kind: string;
+      cmd_id: string;
+      domain: string;
+    }>(`
+      SELECT pass_id, ts_ms, ts_iso, parameter_name, field_path, value_text, unit, source_kind, cmd_id, domain
+      FROM satellite_values
+      ORDER BY ts_ms
+    `);
+    for (const r of observed.rows) {
+      seenNames.add(r.field_path);
+      results.push({
+        pass_id: r.pass_id,
+        ts_ms: r.ts_ms,
+        ts_iso: r.ts_iso || (r.ts_ms ? new Date(Number(r.ts_ms)).toISOString() : ''),
+        name: r.field_path,
+        value: r.value_text ?? '',
+        unit: r.unit ?? '',
+        source: r.source_kind === 'parameter_event' ? 'parameter' : 'decoded',
+        cmd_id: r.cmd_id,
+        domain: r.domain,
+      });
+    }
+
+    for (const p of getCatalogParameterRows()) {
+      if (seenNames.has(p.name)) continue;
+      results.push({
+        pass_id: 0,
+        ts_ms: 0,
+        ts_iso: '',
+        name: p.name,
+        value: '',
+        unit: p.unit,
+        source: 'catalog',
+        domain: p.domain,
+        type: p.type,
+      });
     }
     return results;
   } finally {
@@ -474,12 +572,29 @@ export async function exportDatabase(): Promise<Record<string, unknown[]>> {
 
 type JsonEvent = Record<string, unknown>;
 
+export interface DuplicateInfo {
+  passId: number;
+  sessionId: string;
+  sourceFile: string;
+}
+
 export interface IngestResult {
   passId: number;
   sessionId: string;
   counts: Record<string, number>;
   skipped: number;
   warnings: string[];
+  duplicateOf?: DuplicateInfo;
+}
+
+export async function checkIngestHash(hash: string): Promise<DuplicateInfo | null> {
+  const res = await pool.query<{ pass_id: number; session_id: string; source_file: string }>(
+    'SELECT pass_id, session_id, source_file FROM passes WHERE content_hash = $1 LIMIT 1',
+    [hash],
+  );
+  if (res.rowCount === 0) return null;
+  const row = res.rows[0];
+  return { passId: row.pass_id, sessionId: row.session_id, sourceFile: row.source_file };
 }
 
 function str(v: unknown): string  { return v == null ? '' : String(v); }
@@ -518,6 +633,9 @@ function flatMission(m: unknown): Partial<EventRow> {
 }
 
 export async function ingestJsonl(content: string, sourceFile: string, forcedPassId?: number): Promise<IngestResult> {
+  const contentHash = createHash('sha256').update(content).digest('hex');
+  const duplicateOf = await checkIngestHash(contentHash) ?? undefined;
+
   const lines = content.split('\n').filter((l) => l.trim());
   const events: JsonEvent[] = [];
   let skipped = 0;
@@ -554,20 +672,20 @@ export async function ingestJsonl(content: string, sourceFile: string, forcedPas
       await client.query(`
         INSERT INTO passes
           (pass_id, session_id, source_file, pass_date, pass_time,
-           start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version, content_hash)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       `, [forcedPassId, sessionId, sourceFile, startDate, startTime,
-          startMs, endMs, missionId, operator, station, schemaVer]);
+          startMs, endMs, missionId, operator, station, schemaVer, contentHash]);
       passId = forcedPassId;
     } else {
       const r = await client.query(`
         INSERT INTO passes
           (session_id, source_file, pass_date, pass_time,
-           start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           start_ts_ms, end_ts_ms, mission_id, operator, station, schema_version, content_hash)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         RETURNING pass_id
       `, [sessionId, sourceFile, startDate, startTime,
-          startMs, endMs, missionId, operator, station, schemaVer]);
+          startMs, endMs, missionId, operator, station, schemaVer, contentHash]);
       passId = Number(r.rows[0].pass_id);
     }
 
@@ -681,10 +799,27 @@ export async function ingestJsonl(content: string, sourceFile: string, forcedPas
     client.release();
   }
 
+  // Save raw JSONL to disk for archival.
+  try {
+    mkdirSync(INGESTED_FILES_DIR, { recursive: true });
+    const safeName = sourceFile.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const archivedName = `pass_${passId}_${safeName}`;
+    const archivedPath = join(INGESTED_FILES_DIR, archivedName);
+    writeFileSync(archivedPath, content, 'utf-8');
+    await upsertPassFile({
+      passId,
+      tableId: `pass_${passId}`,
+      filename: archivedName,
+      fileKind: 'ingested_jsonl',
+      relativePath: `ingested_jsonl/${archivedName}`,
+      totalBytes: Buffer.byteLength(content, 'utf-8'),
+    });
+  } catch { /* non-fatal */ }
+
   // Best-effort: decode binary TLM/RES packets and save to decoded_telemetry.
   try { await materializeTelemetry(passId); } catch { /* non-fatal */ }
 
-  return { passId, sessionId, counts, skipped, warnings };
+  return { passId, sessionId, counts, skipped, warnings, duplicateOf };
 }
 
 // ── Decoded telemetry ─────────────────────────────────────────────────────────
@@ -705,6 +840,102 @@ export interface SummaryRow {
   count:  number;
 }
 
+export interface SatelliteValueRow {
+  id?: number;
+  pass_id: number;
+  session_id: string;
+  source_event_id: string;
+  source_kind: string;
+  ts_ms: number;
+  ts_iso: string;
+  cmd_id: string;
+  ptype: string;
+  src: string;
+  dest: string;
+  domain: string;
+  parameter_name: string;
+  field_path: string;
+  display_name: string;
+  unit: string;
+  value_text: string;
+  value_numeric: number | null;
+  value_json: unknown;
+  decoded_ok: string;
+  decode_error: string;
+  raw_hex: string;
+}
+
+export interface ValuesFilter {
+  passIds?: number[];
+  fromMs?: number;
+  toMs?: number;
+  domain?: string;
+  cmd?: string;
+  parameter?: string;
+  fields?: string[];
+  numericOnly?: boolean;
+  limit?: number;
+}
+
+function baseParameterName(field: string): string {
+  return field.split('.')[0] || field;
+}
+
+function numericValue(value: string): number | null {
+  const trimmed = String(value ?? '').trim();
+  if (!trimmed || !/^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+function domainForValue(cmdId: string, field: string, catalogDomains: Map<string, string>): string {
+  const base = baseParameterName(field);
+  const fromCatalog = catalogDomains.get(base) ?? catalogDomains.get(field);
+  if (fromCatalog) return fromCatalog;
+  if (cmdId.startsWith('param:')) return 'params';
+  if (cmdId === 'eps_hk' || base.startsWith('eps_') || /^I_|^V_|^P_|^T_DIE|^TS_ADC|^EPS_/.test(base)) return 'eps';
+  if (cmdId === 'tlm_beacon') {
+    if (['RATE', 'MAG', 'MTQ', 'STAT', 'GNC_MODE', 'ADCS_TMP_BEACON', 'RATE_SRC', 'MAG_SRC'].includes(base)) return 'gnc';
+    return 'spacecraft';
+  }
+  if (cmdId.includes('img') || cmdId.includes('cam') || cmdId.includes('lcd')) return 'imaging';
+  if (cmdId.includes('ppm')) return 'ppm';
+  if (cmdId.includes('cfg')) return 'cfg';
+  if (cmdId.includes('mag') || cmdId.includes('eps_')) return 'hk';
+  return 'other';
+}
+
+function buildValuesWhere(filter: ValuesFilter, startParam = 1): { where: string; params: unknown[] } {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const add = (sql: string, value: unknown) => {
+    params.push(value);
+    clauses.push(sql.replace('?', `$${startParam + params.length - 1}`));
+  };
+  if (filter.passIds?.length) {
+    const ph = filter.passIds.map((_, i) => `$${startParam + params.length + i}`).join(',');
+    clauses.push(`pass_id IN (${ph})`);
+    params.push(...filter.passIds);
+  }
+  if (filter.fromMs) add('ts_ms >= ?', filter.fromMs);
+  if (filter.toMs) add('ts_ms <= ?', filter.toMs);
+  if (filter.domain) add('domain = ?', filter.domain);
+  if (filter.cmd) add('cmd_id = ?', filter.cmd);
+  if (filter.parameter) {
+    const p1 = `$${startParam + params.length}`;
+    const p2 = `$${startParam + params.length + 1}`;
+    clauses.push(`(parameter_name ILIKE ${p1} OR field_path ILIKE ${p2})`);
+    params.push(`%${filter.parameter}%`, `%${filter.parameter}%`);
+  }
+  if (filter.fields?.length) {
+    const ph = filter.fields.map((_, i) => `$${startParam + params.length + i}`).join(',');
+    clauses.push(`field_path IN (${ph})`);
+    params.push(...filter.fields);
+  }
+  if (filter.numericOnly) clauses.push('value_numeric IS NOT NULL');
+  return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
+}
+
 export async function materializeTelemetry(passId: number): Promise<{ count: number }> {
   const tbl = `pass_${passId}`;
   const client = await pool.connect();
@@ -714,14 +945,15 @@ export async function materializeTelemetry(passId: number): Promise<{ count: num
 
     await client.query('DELETE FROM decoded_telemetry WHERE pass_id = $1', [passId]);
 
-    type FrameRow = { ts_ms: number; cmd_id: string; inner_hex: string };
+    type FrameRow = { ts_ms: number; cmd_id: string; ptype: string; inner_hex: string };
     const rows = (await client.query(`
       SELECT ts_ms,
              mission_facts_header_cmd_id AS cmd_id,
+             mission_facts_header_ptype AS ptype,
              inner_hex
       FROM   "${tbl}"
       WHERE  event_kind IN ('rx_packet', 'tx_command')
-        AND  mission_facts_header_ptype IN ('TLM', 'RES')
+        AND  mission_facts_header_ptype IN ('TLM', 'RES', 'ACK', 'NACK', 'FILE')
         AND  inner_hex IS NOT NULL AND inner_hex != ''
       ORDER  BY ts_ms ASC
     `)).rows as FrameRow[];
@@ -731,7 +963,7 @@ export async function materializeTelemetry(passId: number): Promise<{ count: num
     try {
       for (const row of rows) {
         if (!row.cmd_id) continue;
-        const decoded = decodeRow(row.cmd_id, row.inner_hex);
+        const decoded = decodeRow(row.cmd_id, row.inner_hex, row.ptype);
         for (const f of decoded) {
           await client.query(
             'INSERT INTO decoded_telemetry (pass_id, ts_ms, cmd_id, field, value, unit) VALUES ($1,$2,$3,$4,$5,$6)',
@@ -740,6 +972,149 @@ export async function materializeTelemetry(passId: number): Promise<{ count: num
           count++;
         }
       }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+    const values = await materializeSatelliteValues(passId);
+    return { count: values.count || count };
+  } finally {
+    client.release();
+  }
+}
+
+export async function materializeSatelliteValues(passId: number): Promise<{ count: number }> {
+  const tbl = `pass_${passId}`;
+  const client = await pool.connect();
+  try {
+    const exists = await tableExists(client, tbl);
+    if (!exists) throw new Error(`Table ${tbl} does not exist`);
+
+    const passMeta = (await client.query<{ session_id: string }>(
+      'SELECT session_id FROM passes WHERE pass_id = $1',
+      [passId],
+    )).rows[0];
+    const sessionId = passMeta?.session_id ?? '';
+    const catalogDomains = new Map(getCatalogParameterRows().map((p) => [p.name, p.domain]));
+
+    type PacketRow = {
+      event_id: string;
+      ts_ms: number;
+      ts_iso: string;
+      cmd_id: string;
+      ptype: string;
+      src: string;
+      dest: string;
+      inner_hex: string;
+    };
+    const packets = (await client.query(`
+      SELECT event_id, ts_ms, ts_iso,
+             mission_facts_header_cmd_id AS cmd_id,
+             mission_facts_header_ptype  AS ptype,
+             mission_facts_header_src    AS src,
+             mission_facts_header_dest   AS dest,
+             inner_hex
+      FROM "${tbl}"
+      WHERE event_kind IN ('rx_packet', 'tx_command')
+        AND mission_facts_header_ptype IN ('TLM', 'RES', 'ACK', 'NACK', 'FILE')
+        AND inner_hex IS NOT NULL AND inner_hex != ''
+      ORDER BY ts_ms ASC
+    `)).rows as PacketRow[];
+
+    type ParamEventRow = {
+      event_id: string;
+      rx_event_id: string;
+      ts_ms: number;
+      ts_iso: string;
+      name: string;
+      value: string;
+      unit: string;
+      cmd_id: string;
+      ptype: string;
+      src: string;
+      dest: string;
+      inner_hex: string;
+    };
+    const params = (await client.query(`
+      SELECT p.event_id, p.rx_event_id, p.ts_ms, p.ts_iso, p.name, p.value, p.unit,
+             CASE WHEN r.mission_facts_header_cmd_id IS NOT NULL AND r.mission_facts_header_cmd_id != ''
+                  THEN 'param:' || r.mission_facts_header_cmd_id
+                  ELSE 'param:unknown'
+             END AS cmd_id,
+             r.mission_facts_header_ptype AS ptype,
+             r.mission_facts_header_src   AS src,
+             r.mission_facts_header_dest  AS dest,
+             r.inner_hex
+      FROM "${tbl}" p
+      LEFT JOIN "${tbl}" r
+        ON r.event_id = p.rx_event_id AND r.event_kind = 'rx_packet'
+      WHERE p.event_kind = 'parameter' AND p.name IS NOT NULL AND p.name != ''
+      ORDER BY p.ts_ms ASC
+    `)).rows as ParamEventRow[];
+
+    const insertSql = `
+      INSERT INTO satellite_values (
+        pass_id, session_id, source_event_id, source_kind,
+        ts_ms, ts_iso, cmd_id, ptype, src, dest, domain,
+        parameter_name, field_path, display_name, unit,
+        value_text, value_numeric, value_json,
+        decoded_ok, decode_error, raw_hex
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+        $12,$13,$14,$15,$16,$17,$18,$19,$20,$21
+      )
+      ON CONFLICT (pass_id, source_event_id, source_kind, cmd_id, field_path)
+      DO UPDATE SET
+        ts_ms = EXCLUDED.ts_ms,
+        ts_iso = EXCLUDED.ts_iso,
+        domain = EXCLUDED.domain,
+        unit = EXCLUDED.unit,
+        value_text = EXCLUDED.value_text,
+        value_numeric = EXCLUDED.value_numeric,
+        value_json = EXCLUDED.value_json,
+        decoded_ok = EXCLUDED.decoded_ok,
+        decode_error = EXCLUDED.decode_error,
+        raw_hex = EXCLUDED.raw_hex
+    `;
+
+    let count = 0;
+    await client.query('BEGIN');
+    try {
+      await client.query('DELETE FROM satellite_values WHERE pass_id = $1', [passId]);
+
+      for (const row of packets) {
+        if (!row.cmd_id) continue;
+        const decoded = decodeRow(row.cmd_id, row.inner_hex, row.ptype);
+        const sourceEventId = row.event_id || `packet:${passId}:${row.ts_ms}:${row.cmd_id}:${row.inner_hex.slice(0, 16)}`;
+        for (const f of decoded) {
+          const parameterName = baseParameterName(f.field);
+          const domain = domainForValue(row.cmd_id, f.field, catalogDomains);
+          await client.query(insertSql, [
+            passId, sessionId, sourceEventId, 'decoded_packet',
+            row.ts_ms, row.ts_iso ?? '', row.cmd_id, row.ptype ?? '', row.src ?? '', row.dest ?? '', domain,
+            parameterName, f.field, f.field, f.unit ?? '',
+            f.value ?? '', numericValue(f.value), null,
+            '1', '', row.inner_hex ?? '',
+          ]);
+          count++;
+        }
+      }
+
+      for (const row of params) {
+        const sourceEventId = row.event_id || `parameter:${passId}:${row.ts_ms}:${row.name}`;
+        const fieldPath = row.name;
+        const domain = domainForValue(row.cmd_id ?? 'param:unknown', fieldPath, catalogDomains);
+        await client.query(insertSql, [
+          passId, sessionId, sourceEventId, 'parameter_event',
+          row.ts_ms, row.ts_iso ?? '', row.cmd_id ?? 'param:unknown', row.ptype ?? '', row.src ?? '', row.dest ?? '', domain,
+          row.name, fieldPath, row.name, row.unit ?? '',
+          row.value ?? '', numericValue(row.value), null,
+          '1', '', row.inner_hex ?? '',
+        ]);
+        count++;
+      }
+
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -755,71 +1130,50 @@ export async function fetchDecodedSummary(passIds: number[]): Promise<SummaryRow
   if (passIds.length === 0) return [];
   const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
   const res = await pool.query(`
+    WITH sv_passes AS (
+      SELECT DISTINCT pass_id FROM satellite_values WHERE pass_id IN (${ph})
+    ),
+    rows AS (
+      SELECT cmd_id, field_path AS field, unit, pass_id
+      FROM satellite_values
+      WHERE pass_id IN (${ph})
+      UNION ALL
+      SELECT cmd_id, field, unit, pass_id
+      FROM decoded_telemetry
+      WHERE pass_id IN (${ph})
+        AND pass_id NOT IN (SELECT pass_id FROM sv_passes)
+    )
     SELECT cmd_id, field, MAX(unit) AS unit, COUNT(*) AS count
-    FROM   decoded_telemetry
-    WHERE  pass_id IN (${ph})
-    GROUP  BY cmd_id, field
-    ORDER  BY cmd_id, field
+    FROM rows
+    GROUP BY cmd_id, field
+    ORDER BY cmd_id, field
   `, passIds);
-
-  // Append parameter names grouped by their source packet's cmd_id (joined via rx_event_id).
-  // Each group gets cmd_id = 'param:<source_cmd_id>' so they appear as separate sidebar categories.
-  const client = await pool.connect();
-  try {
-    // Accumulate across passes: Map<`param:X`, Map<field, {unit, count}>>
-    const acc = new Map<string, Map<string, { unit: string; count: number }>>();
-    for (const passId of passIds) {
-      const tbl = `pass_${passId}`;
-      const exists = await tableExists(client, tbl);
-      if (!exists) continue;
-      const pr = await client.query<{ cmd_id: string; name: string; unit: string; cnt: string }>(`
-        SELECT
-          CASE WHEN r.mission_facts_header_cmd_id IS NOT NULL AND r.mission_facts_header_cmd_id != ''
-               THEN 'param:' || r.mission_facts_header_cmd_id
-               ELSE 'param:unknown'
-          END AS cmd_id,
-          p.name,
-          MAX(p.unit) AS unit,
-          COUNT(*) AS cnt
-        FROM "${tbl}" p
-        LEFT JOIN "${tbl}" r
-          ON r.event_id = p.rx_event_id AND r.event_kind = 'rx_packet'
-        WHERE p.event_kind = 'parameter' AND p.name IS NOT NULL AND p.name != ''
-        GROUP BY cmd_id, p.name
-        ORDER BY cmd_id, p.name
-      `);
-      for (const r of pr.rows) {
-        if (!acc.has(r.cmd_id)) acc.set(r.cmd_id, new Map());
-        const fields = acc.get(r.cmd_id)!;
-        const existing = fields.get(r.name);
-        if (existing) {
-          existing.count += Number(r.cnt);
-        } else {
-          fields.set(r.name, { unit: r.unit ?? '', count: Number(r.cnt) });
-        }
-      }
-    }
-    const paramRows: SummaryRow[] = [];
-    for (const [cmdId, fields] of acc) {
-      for (const [field, { unit, count }] of fields) {
-        paramRows.push({ cmd_id: cmdId, field, unit, count });
-      }
-    }
-    return [...res.rows as SummaryRow[], ...paramRows];
-  } finally {
-    client.release();
-  }
+  return res.rows as SummaryRow[];
 }
 
 export async function fetchParameterHistory(passIds: number[]): Promise<DecodedRow[]> {
   if (passIds.length === 0) return [];
+  const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
+  const canonical = await pool.query(`
+    SELECT pass_id, ts_ms, cmd_id, field_path AS field, value_text AS value, unit
+    FROM satellite_values
+    WHERE pass_id IN (${ph}) AND source_kind = 'parameter_event'
+    ORDER BY ts_ms ASC
+  `, passIds);
+
+  const svPasses = await pool.query(`
+    SELECT DISTINCT pass_id FROM satellite_values WHERE pass_id IN (${ph})
+  `, passIds);
+  const canonicalPassIds = new Set((svPasses.rows as { pass_id: number }[]).map(r => Number(r.pass_id)));
+  const missingPassIds = passIds.filter(id => !canonicalPassIds.has(id));
+  if (missingPassIds.length === 0) return canonical.rows as DecodedRow[];
+
   const client = await pool.connect();
   try {
-    const results: DecodedRow[] = [];
-    for (const passId of passIds) {
+    const fallback: DecodedRow[] = [];
+    for (const passId of missingPassIds) {
       const tbl = `pass_${passId}`;
-      const exists = await tableExists(client, tbl);
-      if (!exists) continue;
+      if (!(await tableExists(client, tbl))) continue;
       const res = await client.query<{ ts_ms: number; cmd_id: string; name: string; value: string; unit: string }>(`
         SELECT
           p.ts_ms,
@@ -837,10 +1191,10 @@ export async function fetchParameterHistory(passIds: number[]): Promise<DecodedR
         ORDER BY p.ts_ms ASC
       `);
       for (const r of res.rows) {
-        results.push({ pass_id: passId, ts_ms: r.ts_ms, cmd_id: r.cmd_id, field: r.name, value: r.value ?? '', unit: r.unit ?? '' });
+        fallback.push({ pass_id: passId, ts_ms: r.ts_ms, cmd_id: r.cmd_id, field: r.name, value: r.value ?? '', unit: r.unit ?? '' });
       }
     }
-    return results;
+    return [...canonical.rows as DecodedRow[], ...fallback].sort((a, b) => a.ts_ms - b.ts_ms);
   } finally {
     client.release();
   }
@@ -850,10 +1204,22 @@ export async function fetchDecodedTelemetry(passIds: number[], cmd: string): Pro
   if (passIds.length === 0) return [];
   const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
   const res = await pool.query(`
-    SELECT pass_id, ts_ms, cmd_id, field, value, unit
-    FROM   decoded_telemetry
-    WHERE  pass_id IN (${ph}) AND cmd_id = $${passIds.length + 1}
-    ORDER  BY ts_ms ASC
+    WITH sv_passes AS (
+      SELECT DISTINCT pass_id FROM satellite_values WHERE pass_id IN (${ph})
+    ),
+    rows AS (
+      SELECT pass_id, ts_ms, cmd_id, field_path AS field, value_text AS value, unit
+      FROM satellite_values
+      WHERE pass_id IN (${ph}) AND cmd_id = $${passIds.length + 1}
+      UNION ALL
+      SELECT pass_id, ts_ms, cmd_id, field, value, unit
+      FROM decoded_telemetry
+      WHERE pass_id IN (${ph})
+        AND pass_id NOT IN (SELECT pass_id FROM sv_passes)
+        AND cmd_id = $${passIds.length + 1}
+    )
+    SELECT * FROM rows
+    ORDER BY ts_ms ASC
   `, [...passIds, cmd]);
   return res.rows as DecodedRow[];
 }
@@ -862,12 +1228,179 @@ export async function fetchDecodeStatus(passIds: number[]): Promise<Record<numbe
   if (passIds.length === 0) return {};
   const ph  = passIds.map((_, i) => `$${i + 1}`).join(',');
   const res = await pool.query(`
-    SELECT pass_id, COUNT(*) AS cnt
-    FROM   decoded_telemetry
-    WHERE  pass_id IN (${ph})
-    GROUP  BY pass_id
+    WITH sv_counts AS (
+      SELECT pass_id, COUNT(*) AS cnt
+      FROM satellite_values
+      WHERE pass_id IN (${ph})
+      GROUP BY pass_id
+    ),
+    dt_counts AS (
+      SELECT pass_id, COUNT(*) AS cnt
+      FROM decoded_telemetry
+      WHERE pass_id IN (${ph})
+      GROUP BY pass_id
+    )
+    SELECT p.pass_id, COALESCE(NULLIF(sv.cnt, 0), dt.cnt, 0) AS cnt
+    FROM (SELECT unnest(ARRAY[${ph}]::int[]) AS pass_id) p
+    LEFT JOIN sv_counts sv ON sv.pass_id = p.pass_id
+    LEFT JOIN dt_counts dt ON dt.pass_id = p.pass_id
   `, passIds);
   return Object.fromEntries((res.rows as { pass_id: number; cnt: number }[]).map(r => [r.pass_id, r.cnt]));
+}
+
+export async function fetchSatelliteValueSummary(filter: ValuesFilter): Promise<{
+  totalRows: number;
+  numericRows: number;
+  parameters: number;
+  minTs: number | null;
+  maxTs: number | null;
+  domains: { domain: string; count: number }[];
+  commands: { cmd_id: string; count: number }[];
+  fields: { cmd_id: string; field_path: string; count: number }[];
+}> {
+  const { where, params } = buildValuesWhere(filter);
+  const total = await pool.query(`
+    SELECT COUNT(*) AS total_rows,
+           COUNT(value_numeric) AS numeric_rows,
+           COUNT(DISTINCT field_path) AS parameters,
+           MIN(ts_ms) AS min_ts,
+           MAX(ts_ms) AS max_ts
+    FROM satellite_values
+    ${where}
+  `, params);
+  const domains = await pool.query(`
+    SELECT COALESCE(domain, '') AS domain, COUNT(*) AS count
+    FROM satellite_values
+    ${where}
+    GROUP BY domain
+    ORDER BY count DESC, domain
+  `, params);
+  const commands = await pool.query(`
+    SELECT COALESCE(cmd_id, '') AS cmd_id, COUNT(*) AS count
+    FROM satellite_values
+    ${where}
+    GROUP BY cmd_id
+    ORDER BY count DESC, cmd_id
+  `, params);
+  const fields = await pool.query(`
+    SELECT COALESCE(cmd_id, '') AS cmd_id, field_path, COUNT(*) AS count
+    FROM satellite_values
+    ${where}
+    GROUP BY cmd_id, field_path
+    ORDER BY cmd_id, count DESC, field_path
+  `, params);
+  return {
+    totalRows: Number(total.rows[0]?.total_rows ?? 0),
+    numericRows: Number(total.rows[0]?.numeric_rows ?? 0),
+    parameters: Number(total.rows[0]?.parameters ?? 0),
+    minTs: total.rows[0]?.min_ts != null ? Number(total.rows[0].min_ts) : null,
+    maxTs: total.rows[0]?.max_ts != null ? Number(total.rows[0].max_ts) : null,
+    domains: (domains.rows as { domain: string; count: string }[]).map(r => ({ domain: r.domain, count: Number(r.count) })),
+    commands: (commands.rows as { cmd_id: string; count: string }[]).map(r => ({ cmd_id: r.cmd_id, count: Number(r.count) })),
+    fields: (fields.rows as { cmd_id: string; field_path: string; count: string }[]).map(r => ({ cmd_id: r.cmd_id, field_path: r.field_path, count: Number(r.count) })),
+  };
+}
+
+export async function fetchSatelliteValues(filter: ValuesFilter): Promise<SatelliteValueRow[]> {
+  const limit = Math.min(Math.max(filter.limit ?? 5000, 1), 50000);
+  const { where, params } = buildValuesWhere(filter);
+  const res = await pool.query(`
+    SELECT pass_id, session_id, source_event_id, source_kind,
+           ts_ms, ts_iso, cmd_id, ptype, src, dest, domain,
+           parameter_name, field_path, display_name, unit,
+           value_text, value_numeric, value_json,
+           decoded_ok, decode_error, raw_hex
+    FROM satellite_values
+    ${where}
+    ORDER BY ts_ms ASC, pass_id ASC, field_path ASC
+    LIMIT $${params.length + 1}
+  `, [...params, limit]);
+  return res.rows as SatelliteValueRow[];
+}
+
+function csvEscape(value: unknown): string {
+  return JSON.stringify(value ?? '');
+}
+
+function rowsToCsv(rows: Record<string, unknown>[], columns: string[]): string {
+  return [
+    columns.join(','),
+    ...rows.map((r) => columns.map((c) => csvEscape(r[c])).join(',')),
+  ].join('\n');
+}
+
+export async function exportSatelliteValuesCsv(filter: ValuesFilter, format: 'long' | 'wide'): Promise<string> {
+  const rows = await fetchSatelliteValues({ ...filter, limit: 50000 });
+  if (format === 'long') {
+    const cols = [
+      'pass_id', 'session_id', 'ts_iso', 'ts_ms', 'source_kind',
+      'cmd_id', 'ptype', 'domain', 'parameter_name', 'field_path',
+      'value', 'value_numeric', 'unit',
+    ];
+    return rowsToCsv(rows.map((r) => ({
+      ...r,
+      value: r.value_text,
+    })), cols);
+  }
+
+  const fieldPaths = [...new Set(rows.map((r) => r.field_path))].sort();
+  const grouped = new Map<string, Record<string, unknown>>();
+  for (const r of rows) {
+    const key = `${r.pass_id}|${r.source_event_id}|${r.ts_ms}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        pass_id: r.pass_id,
+        session_id: r.session_id,
+        ts_iso: r.ts_iso,
+        ts_ms: r.ts_ms,
+        source_event_id: r.source_event_id,
+        cmd_id: r.cmd_id,
+        ptype: r.ptype,
+      });
+    }
+    const out = grouped.get(key)!;
+    const col = r.domain ? `${r.domain}.${r.field_path}` : r.field_path;
+    out[col] = r.value_numeric ?? r.value_text;
+  }
+  const valueCols = [...new Set(fieldPaths.map((f) => {
+    const row = rows.find((r) => r.field_path === f);
+    return row?.domain ? `${row.domain}.${f}` : f;
+  }))].sort();
+  return rowsToCsv([...grouped.values()], [
+    'pass_id', 'session_id', 'ts_iso', 'ts_ms', 'source_event_id', 'cmd_id', 'ptype',
+    ...valueCols,
+  ]);
+}
+
+export async function materializeSatelliteValuesForPasses(passIds: number[]): Promise<Record<number, number>> {
+  const out: Record<number, number> = {};
+  for (const passId of passIds) {
+    const result = await materializeSatelliteValues(passId);
+    out[passId] = result.count;
+  }
+  return out;
+}
+
+export async function reDecodeAllPasses(): Promise<{ passId: number; count: number; error?: string }[]> {
+  const client = await pool.connect();
+  let passIds: number[];
+  try {
+    const res = await client.query('SELECT pass_id FROM passes ORDER BY pass_id ASC');
+    passIds = (res.rows as { pass_id: number }[]).map(r => r.pass_id);
+  } finally {
+    client.release();
+  }
+
+  const results: { passId: number; count: number; error?: string }[] = [];
+  for (const passId of passIds) {
+    try {
+      const { count } = await materializeTelemetry(passId);
+      results.push({ passId, count });
+    } catch (err) {
+      results.push({ passId, count: 0, error: String(err) });
+    }
+  }
+  return results;
 }
 
 // ── Manual beacon entry ───────────────────────────────────────────────────────
@@ -890,7 +1423,7 @@ export function previewBeacons(hexLines: string[]): BeaconPreview[] {
     try {
       const parsed = parseInnerHex(hex);
       if (!parsed) return { lineIndex, hex, cmdId: null, fields: [], error: 'Could not parse inner frame structure' };
-      const fields = decodeRow(parsed.cmdName, hex);
+      const fields = decodeRow(parsed.cmdName, hex, 'TLM');
       return { lineIndex, hex, cmdId: parsed.cmdName, fields, error: null };
     } catch (e) {
       return { lineIndex, hex, cmdId: null, fields: [], error: String(e) };
@@ -943,16 +1476,44 @@ export async function insertBeacons(passId: number, hexLines: string[]): Promise
   }
 }
 
-export async function deletePass(passId: number): Promise<void> {
+export async function deletePass(passId: number, options: { deleteFiles?: boolean } = {}): Promise<void> {
   const client = await pool.connect();
+  let committed = false;
   try {
+    let filePaths: string[] = [];
+    if (options.deleteFiles) {
+      const files = await client.query<{ relative_path: string }>(
+        'SELECT relative_path FROM pass_files WHERE pass_id = $1',
+        [passId],
+      );
+      filePaths = files.rows.map(r => r.relative_path).filter(Boolean);
+    }
+
     await client.query('BEGIN');
     await client.query(`DROP TABLE IF EXISTS "pass_${passId}"`);
     await client.query('DELETE FROM passes WHERE pass_id = $1', [passId]);
     await client.query('DELETE FROM decoded_telemetry WHERE pass_id = $1', [passId]);
+    await client.query('DELETE FROM satellite_values WHERE pass_id = $1', [passId]);
+    await client.query('DELETE FROM pass_files WHERE pass_id = $1', [passId]);
     await client.query('COMMIT');
+    committed = true;
+
+    if (options.deleteFiles) {
+      for (const relativePath of filePaths) {
+        const root = relativePath.startsWith('ingested_jsonl/')
+          ? INGESTED_FILES_DIR
+          : relativePath.startsWith(`assembled_files/pass_${passId}/`)
+            ? FILES_DIR
+            : null;
+        if (!root) continue;
+        const absolutePath = resolve(process.cwd(), relativePath);
+        if (!absolutePath.startsWith(resolve(root))) continue;
+        rmSync(absolutePath, { force: true });
+      }
+      rmSync(join(FILES_DIR, `pass_${passId}`), { recursive: true, force: true });
+    }
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (!committed) await client.query('ROLLBACK');
     throw err;
   } finally {
     client.release();
@@ -961,9 +1522,137 @@ export async function deletePass(passId: number): Promise<void> {
 
 // ── File assembly ─────────────────────────────────────────────────────────────
 
-export const FILES_DIR = resolve(process.cwd(), 'assembled_files');
+export const FILES_DIR         = resolve(process.cwd(), 'assembled_files');
+export const INGESTED_FILES_DIR = resolve(process.cwd(), 'ingested_jsonl');
 
 const INNER_HDR = 8;
+
+function passIdFromTableId(tableId: string): number | null {
+  const m = /^pass_(\d+)$/.exec(tableId);
+  return m ? Number(m[1]) : null;
+}
+
+function mimeForFile(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.json')) return 'application/json';
+  if (lower.endsWith('.txt') || lower.endsWith('.log')) return 'text/plain';
+  if (lower.endsWith('.npz')) return 'application/octet-stream';
+  return 'application/octet-stream';
+}
+
+function fileDownloadUrl(tableId: string, fileKind: string, filename: string): string {
+  if (fileKind === 'ingested_jsonl') {
+    return `/api/passes/${passIdFromTableId(tableId)}/files/${encodeURIComponent(filename)}`;
+  }
+  return `/api/tables/${tableId}/assembled-files/${encodeURIComponent(filename)}`;
+}
+
+async function upsertPassFile(info: {
+  passId: number;
+  tableId: string;
+  filename: string;
+  fileKind: string;
+  relativePath: string;
+  totalBytes: number;
+  chunkCount?: number;
+}): Promise<void> {
+  await pool.query(`
+    INSERT INTO pass_files
+      (pass_id, table_id, filename, file_kind, mime_type, relative_path, download_url, total_bytes, chunk_count)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    ON CONFLICT (pass_id, file_kind, filename)
+    DO UPDATE SET
+      table_id = EXCLUDED.table_id,
+      mime_type = EXCLUDED.mime_type,
+      relative_path = EXCLUDED.relative_path,
+      download_url = EXCLUDED.download_url,
+      total_bytes = EXCLUDED.total_bytes,
+      chunk_count = EXCLUDED.chunk_count,
+      updated_at = now()
+  `, [
+    info.passId,
+    info.tableId,
+    info.filename,
+    info.fileKind,
+    mimeForFile(info.filename),
+    info.relativePath,
+    fileDownloadUrl(info.tableId, info.fileKind, info.filename),
+    info.totalBytes,
+    info.chunkCount ?? 0,
+  ]);
+}
+
+async function indexExistingPassFiles(client: PoolClient, passIds: number[]): Promise<void> {
+  for (const passId of passIds) {
+    const tableId = `pass_${passId}`;
+    const assembledDir = join(FILES_DIR, tableId);
+    if (existsSync(assembledDir)) {
+      for (const filename of readdirSync(assembledDir)) {
+        const filePath = join(assembledDir, filename);
+        const stat = statSync(filePath);
+        if (!stat.isFile()) continue;
+        await client.query(`
+          INSERT INTO pass_files
+            (pass_id, table_id, filename, file_kind, mime_type, relative_path, download_url, total_bytes, chunk_count)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          ON CONFLICT (pass_id, file_kind, filename)
+          DO UPDATE SET
+            table_id = EXCLUDED.table_id,
+            mime_type = EXCLUDED.mime_type,
+            relative_path = EXCLUDED.relative_path,
+            download_url = EXCLUDED.download_url,
+            total_bytes = EXCLUDED.total_bytes,
+            updated_at = now()
+        `, [
+          passId,
+          tableId,
+          filename,
+          'assembled',
+          mimeForFile(filename),
+          `assembled_files/${tableId}/${filename}`,
+          fileDownloadUrl(tableId, 'assembled', filename),
+          stat.size,
+          0,
+        ]);
+      }
+    }
+
+    if (existsSync(INGESTED_FILES_DIR)) {
+      for (const filename of readdirSync(INGESTED_FILES_DIR)) {
+        if (!filename.startsWith(`pass_${passId}_`)) continue;
+        const filePath = join(INGESTED_FILES_DIR, filename);
+        const stat = statSync(filePath);
+        if (!stat.isFile()) continue;
+        await client.query(`
+          INSERT INTO pass_files
+            (pass_id, table_id, filename, file_kind, mime_type, relative_path, download_url, total_bytes, chunk_count)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          ON CONFLICT (pass_id, file_kind, filename)
+          DO UPDATE SET
+            table_id = EXCLUDED.table_id,
+            mime_type = EXCLUDED.mime_type,
+            relative_path = EXCLUDED.relative_path,
+            download_url = EXCLUDED.download_url,
+            total_bytes = EXCLUDED.total_bytes,
+            updated_at = now()
+        `, [
+          passId,
+          tableId,
+          filename,
+          'ingested_jsonl',
+          mimeForFile(filename),
+          `ingested_jsonl/${filename}`,
+          fileDownloadUrl(tableId, 'ingested_jsonl', filename),
+          stat.size,
+          0,
+        ]);
+      }
+    }
+  }
+}
 
 function parseInnerHexServer(hex: string): Buffer | null {
   if (!hex || hex.length < (INNER_HDR + 2) * 2) return null;
@@ -1005,10 +1694,16 @@ export interface AssembledFileInfo {
   filename: string;
   totalBytes: number;
   chunkCount: number;
+  fileKind?: string;
+  mimeType?: string;
+  relativePath?: string;
+  downloadUrl?: string;
 }
 
 export async function assembleFilesForTable(tableId: string): Promise<AssembledFileInfo[]> {
   if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const passId = passIdFromTableId(tableId);
+  if (!passId) throw new Error('Invalid pass table name');
 
   const res = await pool.query(`
     SELECT inner_hex
@@ -1038,19 +1733,253 @@ export async function assembleFilesForTable(tableId: string): Promise<AssembledF
   for (const [filename, chunks] of fileMap) {
     const sorted   = [...chunks.keys()].sort((a, b) => a - b).map(i => chunks.get(i)!);
     const assembled = Buffer.concat(sorted);
-    writeFileSync(join(outDir, filename), assembled);
-    results.push({ filename, totalBytes: assembled.length, chunkCount: chunks.size });
+    const filePath = join(outDir, filename);
+    writeFileSync(filePath, assembled);
+    const relativePath = `assembled_files/${tableId}/${filename}`;
+    const downloadUrl = fileDownloadUrl(tableId, 'assembled', filename);
+    await upsertPassFile({
+      passId,
+      tableId,
+      filename,
+      fileKind: 'assembled',
+      relativePath,
+      totalBytes: assembled.length,
+      chunkCount: chunks.size,
+    });
+    results.push({
+      filename,
+      totalBytes: assembled.length,
+      chunkCount: chunks.size,
+      fileKind: 'assembled',
+      mimeType: mimeForFile(filename),
+      relativePath,
+      downloadUrl,
+    });
   }
   return results;
 }
 
-export function listAssembledFiles(tableId: string): AssembledFileInfo[] {
+export async function listAssembledFiles(tableId: string): Promise<AssembledFileInfo[]> {
   if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const passId = passIdFromTableId(tableId);
+  if (!passId) throw new Error('Invalid pass table name');
+  const indexed = await pool.query<{
+    filename: string;
+    total_bytes: number;
+    chunk_count: number;
+    file_kind: string;
+    mime_type: string;
+    relative_path: string;
+    download_url: string;
+  }>(`
+    SELECT filename, total_bytes, chunk_count, file_kind, mime_type, relative_path, download_url
+    FROM pass_files
+    WHERE pass_id = $1 AND file_kind = 'assembled'
+    ORDER BY filename ASC
+  `, [passId]);
+  if (indexed.rows.length > 0) {
+    return indexed.rows.map(r => ({
+      filename: r.filename,
+      totalBytes: Number(r.total_bytes),
+      chunkCount: Number(r.chunk_count),
+      fileKind: r.file_kind,
+      mimeType: r.mime_type,
+      relativePath: r.relative_path,
+      downloadUrl: r.download_url,
+    }));
+  }
+
   const dir = join(FILES_DIR, tableId);
   if (!existsSync(dir)) return [];
-  return readdirSync(dir).map(name => ({
-    filename: name,
-    totalBytes: statSync(join(dir, name)).size,
-    chunkCount: 0,
+  const files: AssembledFileInfo[] = [];
+  for (const name of readdirSync(dir)) {
+    const totalBytes = statSync(join(dir, name)).size;
+    const relativePath = `assembled_files/${tableId}/${name}`;
+    await upsertPassFile({
+      passId,
+      tableId,
+      filename: name,
+      fileKind: 'assembled',
+      relativePath,
+      totalBytes,
+    });
+    files.push({
+      filename: name,
+      totalBytes,
+      chunkCount: 0,
+      fileKind: 'assembled',
+      mimeType: mimeForFile(name),
+      relativePath,
+      downloadUrl: fileDownloadUrl(tableId, 'assembled', name),
+    });
+  }
+  return files;
+}
+
+export async function listPassFiles(passId: number): Promise<AssembledFileInfo[]> {
+  const res = await pool.query<{
+    filename: string;
+    total_bytes: number;
+    chunk_count: number;
+    file_kind: string;
+    mime_type: string;
+    relative_path: string;
+    download_url: string;
+  }>(`
+    SELECT filename, total_bytes, chunk_count, file_kind, mime_type, relative_path, download_url
+    FROM pass_files
+    WHERE pass_id = $1
+    ORDER BY file_kind ASC, filename ASC
+  `, [passId]);
+  return res.rows.map(r => ({
+    filename: r.filename,
+    totalBytes: Number(r.total_bytes),
+    chunkCount: Number(r.chunk_count),
+    fileKind: r.file_kind,
+    mimeType: r.mime_type,
+    relativePath: r.relative_path,
+    downloadUrl: r.download_url,
   }));
+}
+
+// ── Pass report data ──────────────────────────────────────────────────────────
+
+export interface PassReportMeta {
+  pass_id: number;
+  session_id: string;
+  pass_date: string;
+  pass_time: string;
+  mission_id: string;
+  operator: string;
+  station: string;
+  start_ts_ms: number | null;
+  end_ts_ms: number | null;
+  source_file: string;
+}
+
+export interface PassReportCommand {
+  event_id: string;
+  ts_iso: string;
+  cmd_id: string;
+  outcome: string | null;
+  elapsed_ms: number | null;
+}
+
+export interface PassReportWarning {
+  event_id: string | null;
+  ts_iso: string;
+  source: 'RX' | 'TX' | 'ALARM';
+  label: string;
+  detail: string;
+  severity: string | null;
+}
+
+export interface PassReport {
+  meta: PassReportMeta;
+  commands: PassReportCommand[];
+  warnings: PassReportWarning[];
+}
+
+export async function fetchPassReport(passId: number): Promise<PassReport> {
+  const client = await pool.connect();
+  try {
+    const metaRes = await client.query(
+      'SELECT * FROM passes WHERE pass_id = $1',
+      [passId],
+    );
+    if (metaRes.rowCount === 0) throw new Error(`Pass ${passId} not found`);
+    const meta = metaRes.rows[0] as PassReportMeta;
+
+    const tbl = `pass_${passId}`;
+    const tblCheck = await client.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1`,
+      [tbl],
+    );
+    if ((tblCheck.rowCount ?? 0) === 0) {
+      return { meta, commands: [], warnings: [] };
+    }
+
+    // Commands: tx_command events, joined with cmd_verifier outcomes
+    const cmdRes = await client.query(`
+      SELECT
+        tx.event_id,
+        COALESCE(tx.ts_iso, to_char(to_timestamp(tx.ts_ms / 1000.0), 'YYYY-MM-DD"T"HH24:MI:SS"Z"')) AS ts_iso,
+        COALESCE(tx.mission_facts_header_cmd_id, tx.frame_label, '') AS cmd_id,
+        cv.outcome,
+        cv.elapsed_ms
+      FROM "${tbl}" tx
+      LEFT JOIN LATERAL (
+        SELECT outcome, elapsed_ms
+        FROM "${tbl}"
+        WHERE event_kind = 'cmd_verifier' AND cmd_event_id = tx.event_id
+        ORDER BY ts_ms DESC LIMIT 1
+      ) cv ON true
+      WHERE tx.event_kind = 'tx_command'
+      ORDER BY tx.ts_ms ASC
+    `);
+
+    // Errors/warnings:
+    //   RX errors  — rx_packet events that have a non-empty warnings array
+    //   TX errors  — cmd_verifier events whose outcome is a failure
+    //   Alarms     — alarm events (any severity)
+    const warnRes = await client.query(`
+      SELECT event_id, ts_iso_norm AS ts_iso, source, label, detail, severity
+      FROM (
+        -- RX errors: received packets flagged with warnings
+        SELECT
+          event_id,
+          COALESCE(ts_iso, to_char(to_timestamp(ts_ms / 1000.0), 'YYYY-MM-DD"T"HH24:MI:SS"Z"')) AS ts_iso_norm,
+          ts_ms,
+          'RX'::text AS source,
+          COALESCE(frame_label, '') AS label,
+          warnings AS detail,
+          NULL::text AS severity
+        FROM "${tbl}"
+        WHERE event_kind = 'rx_packet'
+          AND warnings IS NOT NULL AND warnings <> '' AND warnings <> 'null' AND warnings <> '[]'
+
+        UNION ALL
+
+        -- TX errors: cmd_verifier outcomes that indicate failure
+        SELECT
+          cv.event_id,
+          COALESCE(cv.ts_iso, to_char(to_timestamp(cv.ts_ms / 1000.0), 'YYYY-MM-DD"T"HH24:MI:SS"Z"')) AS ts_iso_norm,
+          cv.ts_ms,
+          'TX'::text AS source,
+          COALESCE(tx.mission_facts_header_cmd_id, tx.frame_label, cv.verifier_id, '') AS label,
+          COALESCE(cv.stage, '') AS detail,
+          cv.outcome AS severity
+        FROM "${tbl}" cv
+        LEFT JOIN "${tbl}" tx ON tx.event_id = cv.cmd_event_id
+        WHERE cv.event_kind = 'cmd_verifier'
+          AND cv.outcome IS NOT NULL
+          AND cv.outcome NOT IN ('SUCCESS', 'COMPLETE', 'COMPLETED', 'ACK', '')
+          AND LOWER(cv.outcome) NOT IN ('pass', 'passed')
+
+        UNION ALL
+
+        -- Alarms: all alarm state-change events, excluding severity = 'pass'
+        SELECT
+          event_id,
+          COALESCE(ts_iso, to_char(to_timestamp(ts_ms / 1000.0), 'YYYY-MM-DD"T"HH24:MI:SS"Z"')) AS ts_iso_norm,
+          ts_ms,
+          'ALARM'::text AS source,
+          COALESCE(alarm_label, '') AS label,
+          COALESCE(alarm_detail, '') AS detail,
+          alarm_severity AS severity
+        FROM "${tbl}"
+        WHERE event_kind = 'alarm'
+          AND (alarm_severity IS NULL OR LOWER(alarm_severity) NOT IN ('pass', 'passed'))
+      ) sub
+      ORDER BY ts_ms ASC
+    `);
+
+    return {
+      meta,
+      commands: cmdRes.rows as PassReportCommand[],
+      warnings: warnRes.rows as PassReportWarning[],
+    };
+  } finally {
+    client.release();
+  }
 }

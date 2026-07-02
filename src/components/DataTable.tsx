@@ -25,17 +25,23 @@ export function DataTable({
   const total = columns.reduce((a, c) => a + c.width, 0) + 60;
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(600);
+  const [headerH, setHeaderH] = useState(29);
 
-  // Track viewport height (mount + resize)
+  // Track viewport + header height (mount + resize)
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const measure = () => setViewportH(el.clientHeight);
+    const measure = () => {
+      setViewportH(el.clientHeight);
+      if (headerRef.current) setHeaderH(headerRef.current.offsetHeight);
+    };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(el);
+    if (headerRef.current) ro.observe(headerRef.current);
     return () => ro.disconnect();
   }, []);
 
@@ -47,11 +53,12 @@ export function DataTable({
   }, [rows]);
 
   const count = rows.length;
-  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  // Window relative to the rows track, which begins below the sticky header.
+  const rowsScroll = Math.max(0, scrollTop - headerH);
+  const startIdx = Math.max(0, Math.floor(rowsScroll / ROW_H) - OVERSCAN);
   const visibleCount = Math.ceil(viewportH / ROW_H) + OVERSCAN * 2;
   const endIdx = Math.min(count, startIdx + visibleCount);
   const topPad = startIdx * ROW_H;
-  const bottomPad = Math.max(0, (count - endIdx) * ROW_H);
 
   const visibleRows = rows.slice(startIdx, endIdx);
 
@@ -63,7 +70,7 @@ export function DataTable({
     >
       <div style={{ minWidth: total }}>
         {/* Sticky header — scrolls horizontally with the content, stays fixed vertically */}
-        <div style={{
+        <div ref={headerRef} style={{
           display: 'flex',
           backgroundColor: C.bgPanel,
           borderBottom: `1px solid ${C.borderStrong}`,
@@ -87,7 +94,6 @@ export function DataTable({
           ))}
         </div>
 
-        {/* Body rows */}
         {loading && (
           <div style={{ padding: 32, textAlign: 'center', color: C.textMuted, fontSize: 12, fontFamily: C.fontMono }}>
             loading…
@@ -99,50 +105,53 @@ export function DataTable({
           </div>
         )}
 
-        {/* Top spacer keeps the scroll height correct for skipped rows */}
-        {topPad > 0 && <div style={{ height: topPad }} />}
-
-        {visibleRows.map((row) => {
-          const sel = selected?.__idx === row.__idx;
-          const flash = highlightRow === row.__idx;
-          return (
-            <div
-              key={row.__idx}
-              onClick={() => onSelect(row)}
-              style={{
-                display: 'flex',
-                height: ROW_H,
-                boxSizing: 'border-box',
-                alignItems: 'center',
-                borderBottom: `1px solid ${C.borderSubtle}`,
-                borderLeft: `2px solid ${sel ? C.active : 'transparent'}`,
-                backgroundColor: sel ? C.bgPanelRaised : flash ? 'rgba(60,201,142,0.06)' : 'transparent',
-                cursor: 'pointer',
-                transition: 'background-color 80ms ease',
-              }}
-              onMouseEnter={(e) => { if (!sel) (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.025)'; }}
-              onMouseLeave={(e) => { if (!sel) (e.currentTarget as HTMLElement).style.backgroundColor = flash ? 'rgba(60,201,142,0.06)' : 'transparent'; }}
-            >
-              <div style={{
-                flex: '0 0 60px',
-                padding: '0 8px',
-                textAlign: 'right',
-                fontFamily: C.fontMono,
-                fontSize: 10.5,
-                color: sel ? C.active : C.textDisabled,
-                borderRight: `1px solid ${C.borderSubtle}`,
-              }}>
-                {(row.__idx + 1).toString().padStart(4, '0')}
-              </div>
-              {columns.map((c) => (
-                <Cell key={c.id} col={c} value={row[c.id]} />
-              ))}
+        {/* Constant-height track: keeps the scroll height stable so the sticky
+            header never sees sibling height changes (which caused scroll flicker).
+            Visible rows are offset with a transform instead of variable spacers. */}
+        {count > 0 && (
+          <div style={{ position: 'relative', height: count * ROW_H }}>
+            <div style={{ transform: `translateY(${topPad}px)` }}>
+              {visibleRows.map((row) => {
+                const sel = selected?.__idx === row.__idx;
+                const flash = highlightRow === row.__idx;
+                return (
+                  <div
+                    key={row.__idx}
+                    onClick={() => onSelect(row)}
+                    style={{
+                      display: 'flex',
+                      height: ROW_H,
+                      boxSizing: 'border-box',
+                      alignItems: 'center',
+                      borderBottom: `1px solid ${C.borderSubtle}`,
+                      borderLeft: `2px solid ${sel ? C.active : 'transparent'}`,
+                      backgroundColor: sel ? C.bgPanelRaised : flash ? 'rgba(60,201,142,0.06)' : 'transparent',
+                      cursor: 'pointer',
+                      transition: 'background-color 80ms ease',
+                    }}
+                    onMouseEnter={(e) => { if (!sel) (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.025)'; }}
+                    onMouseLeave={(e) => { if (!sel) (e.currentTarget as HTMLElement).style.backgroundColor = flash ? 'rgba(60,201,142,0.06)' : 'transparent'; }}
+                  >
+                    <div style={{
+                      flex: '0 0 60px',
+                      padding: '0 8px',
+                      textAlign: 'right',
+                      fontFamily: C.fontMono,
+                      fontSize: 10.5,
+                      color: sel ? C.active : C.textDisabled,
+                      borderRight: `1px solid ${C.borderSubtle}`,
+                    }}>
+                      {(row.__idx + 1).toString().padStart(4, '0')}
+                    </div>
+                    {columns.map((c) => (
+                      <Cell key={c.id} col={c} value={row[c.id]} />
+                    ))}
+                  </div>
+                );
+              })}
             </div>
-          );
-        })}
-
-        {/* Bottom spacer */}
-        {bottomPad > 0 && <div style={{ height: bottomPad }} />}
+          </div>
+        )}
       </div>
     </div>
   );

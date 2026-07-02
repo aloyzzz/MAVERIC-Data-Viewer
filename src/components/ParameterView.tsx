@@ -1,17 +1,16 @@
 import { useState, useMemo, CSSProperties } from 'react';
 import { C } from '../lib/colors';
+import { useTz, fmtIso } from '../lib/timezone';
 import { useAllParameters } from '../hooks/useApi';
 import type { ParameterRow } from '../hooks/useApi';
 import { Sparkline } from './Sparkline';
 
-/* ─── helpers ─────────────────────────────────────────────────────────────── */
-
-function fmtTs(iso: string) {
-  return iso ? iso.replace('T', ' ').slice(0, 23) + ' UTC' : '—';
-}
-
 function isNumeric(rows: ParameterRow[]) {
   return rows.some((r) => r.value !== '' && !isNaN(Number(r.value)));
+}
+
+function hasReading(r: ParameterRow) {
+  return r.source !== 'catalog' && r.ts_ms > 0;
 }
 
 /* ─── sub-components ──────────────────────────────────────────────────────── */
@@ -79,19 +78,51 @@ function NameRow({ name, latest, unit, count, active, onClick }: NameRowProps) {
 /* ─── main component ──────────────────────────────────────────────────────── */
 
 export function ParameterView() {
+  const { tz } = useTz();
   const { rows: allRows, loading } = useAllParameters();
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
 
   /* unique names with metadata */
   const nameIndex = useMemo(() => {
-    const map = new Map<string, { latest: string; unit: string; count: number; latestTs: number }>();
+    const map = new Map<string, {
+      latest: string;
+      unit: string;
+      count: number;
+      latestTs: number;
+      source: string;
+      domain: string;
+      type: string;
+    }>();
     for (const r of allRows) {
       const entry = map.get(r.name);
-      if (!entry || r.ts_ms > entry.latestTs) {
-        map.set(r.name, { latest: r.value, unit: r.unit, count: (entry?.count ?? 0) + 1, latestTs: r.ts_ms });
-      } else {
+      const observed = hasReading(r);
+      if (!entry) {
+        map.set(r.name, {
+          latest: observed ? r.value : '',
+          unit: r.unit,
+          count: observed ? 1 : 0,
+          latestTs: observed ? r.ts_ms : 0,
+          source: r.source ?? 'parameter',
+          domain: r.domain ?? '',
+          type: r.type ?? '',
+        });
+      } else if (observed && r.ts_ms > entry.latestTs) {
+        map.set(r.name, {
+          latest: r.value,
+          unit: r.unit || entry.unit,
+          count: entry.count + 1,
+          latestTs: r.ts_ms,
+          source: r.source ?? entry.source,
+          domain: r.domain ?? entry.domain,
+          type: r.type ?? entry.type,
+        });
+      } else if (observed) {
         entry.count += 1;
+      } else {
+        entry.unit ||= r.unit;
+        entry.domain ||= r.domain ?? '';
+        entry.type ||= r.type ?? '';
       }
     }
     return map;
@@ -106,9 +137,11 @@ export function ParameterView() {
 
   /* history for selected parameter */
   const history = useMemo(
-    () => selected ? allRows.filter((r) => r.name === selected).sort((a, b) => a.ts_ms - b.ts_ms) : [],
+    () => selected ? allRows.filter((r) => r.name === selected && hasReading(r)).sort((a, b) => a.ts_ms - b.ts_ms) : [],
     [allRows, selected],
   );
+
+  const selectedMeta = selected ? nameIndex.get(selected) : null;
 
   const numeric = useMemo(() => isNumeric(history), [history]);
 
@@ -160,7 +193,7 @@ export function ParameterView() {
           />
         </div>
         <SectionLabel>
-          {loading ? 'loading…' : `${filteredNames.length} / ${nameIndex.size} parameters`}
+          {loading ? 'loading…' : `${filteredNames.length} / ${nameIndex.size} known parameters`}
         </SectionLabel>
         <div style={{ flex: 1, overflowY: 'auto' }}>
           {filteredNames.map((name) => {
@@ -204,7 +237,9 @@ export function ParameterView() {
               <div style={{ fontSize: 14, fontFamily: C.fontMono, color: C.textPrimary }}>{selected}</div>
               <div style={{ fontSize: 10.5, fontFamily: C.fontMono, color: C.textMuted, marginTop: 3, display: 'flex', gap: 16 }}>
                 <span>{history.length} readings</span>
-                <span>passes: {passIds.join(', ')}</span>
+                {passIds.length > 0 && <span>passes: {passIds.join(', ')}</span>}
+                {selectedMeta?.domain && <span>domain: {selectedMeta.domain}</span>}
+                {selectedMeta?.type && <span>type: {selectedMeta.type}</span>}
                 {stats && (
                   <>
                     <span>min: {stats.min}</span>
@@ -227,7 +262,17 @@ export function ParameterView() {
 
             {/* table */}
             <div style={{ flex: 1, overflowY: 'auto' }}>
-              <table style={{
+              {history.length === 0 ? (
+                <div style={{
+                  padding: 24,
+                  fontFamily: C.fontMono,
+                  fontSize: 11,
+                  color: C.textDisabled,
+                }}>
+                  known in mission catalog, not observed in imported passes
+                </div>
+              ) : (
+                <table style={{
                 width: '100%', borderCollapse: 'collapse',
                 fontFamily: C.fontMono, fontSize: 11,
               }}>
@@ -252,14 +297,15 @@ export function ParameterView() {
                       key={i}
                       style={{ borderBottom: `1px solid ${C.borderSubtle}` }}
                     >
-                      <td style={{ padding: '4px 12px', color: C.textMuted }}>{fmtTs(r.ts_iso)}</td>
+                      <td style={{ padding: '4px 12px', color: C.textMuted }}>{r.ts_iso ? fmtIso(r.ts_iso, tz) : '—'}</td>
                       <td style={{ padding: '4px 12px', color: C.textPrimary }}>{r.value}</td>
                       <td style={{ padding: '4px 12px', color: C.textDisabled }}>{r.unit || '—'}</td>
                       <td style={{ padding: '4px 12px', color: C.textDisabled }}>{r.pass_id}</td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
+                </table>
+              )}
             </div>
 
             {/* status bar */}

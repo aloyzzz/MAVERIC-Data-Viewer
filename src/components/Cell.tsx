@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react';
 import { C, toneOf, toneColor, toneFill, frameColor } from '../lib/colors';
+import { useTz, fmtIso } from '../lib/timezone';
 import type { ColumnDef } from '../types';
 
 interface CellProps {
@@ -8,6 +9,7 @@ interface CellProps {
 }
 
 export function Cell({ col, value }: CellProps) {
+  const { tz } = useTz();
   const base: CSSProperties = {
     flex: `0 0 ${col.width}px`,
     width: col.width,
@@ -76,7 +78,10 @@ export function Cell({ col, value }: CellProps) {
   }
 
   if (col.type === 'time') {
-    return <div style={{ ...base, color: C.textSecondary, fontFamily: C.fontMono }}>{String(value)}</div>;
+    const raw = String(value);
+    // Only convert ISO timestamps (contain 'T' and end with 'Z'); leave pass_date / pass_time strings as-is
+    const display = /^\d{4}-\d{2}-\d{2}T/.test(raw) ? fmtIso(raw, tz) : raw;
+    return <div style={{ ...base, color: C.textSecondary, fontFamily: C.fontMono }}>{display}</div>;
   }
 
   return <div style={base}>{String(value)}</div>;

@@ -8,6 +8,10 @@ export interface ParameterRow {
   name: string;
   value: string;
   unit: string;
+  source?: string;
+  cmd_id?: string;
+  domain?: string;
+  type?: string;
 }
 
 export function useSchema(refreshKey = 0) {

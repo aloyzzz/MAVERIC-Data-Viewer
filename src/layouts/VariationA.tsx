@@ -16,6 +16,10 @@ import { DecodedFramesTab, TelemetryTab, FilesTab } from '../components/DecodedF
 import { HistoryTab } from '../components/LiveTab';
 import { BeaconEntryTab } from '../components/BeaconEntryTab';
 import { ParameterView } from '../components/ParameterView';
+import { GenerateReportsPage } from '../components/GenerateReportsPage';
+import { ManagementPage } from '../components/ManagementPage';
+import { DataExplorerTab } from '../components/DataExplorerTab';
+import { SettingsPage } from '../components/SettingsPage';
 
 const NAV_TABS = [
   { id: '__dashboard__', label: 'Dashboard' },
@@ -23,6 +27,8 @@ const NAV_TABS = [
   { id: '__params__', label: 'Parameters' },
   { id: '__live__', label: 'History' },
   { id: '__ingest__', label: 'Ingest' },
+  { id: '__reports__', label: 'Reports' },
+  { id: '__settings__', label: 'Settings' },
 ];
 
 interface VariationAProps {
@@ -49,6 +55,8 @@ export function VariationA({ schema, onSchemaRefresh }: VariationAProps) {
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [limit, setLimit] = useState(1000);
   const [ingestSubTab, setIngestSubTab] = useState<'file' | 'beacon'>('file');
+  const [dataRefreshKey, setDataRefreshKey] = useState(0);
+  const bumpDataRefresh = () => setDataRefreshKey(k => k + 1);
 
   const { rows: allRows, loading } = useTableRows(activeId, limit);
 
@@ -131,9 +139,14 @@ export function VariationA({ schema, onSchemaRefresh }: VariationAProps) {
       {/* Parameters tab */}
       {navTab === '__params__' && <ParameterView />}
 
+      {/* Database tab */}
+      {navTab === '__db__' && (
+        <DataExplorerTab schema={schema} onSchemaRefresh={onSchemaRefresh} />
+      )}
+
       {/* History tab — always mounted so pass selections and chart layouts survive tab switches */}
       <div style={{ display: navTab === '__live__' ? 'flex' : 'none', flex: 1, minHeight: 0, flexDirection: 'column' }}>
-        <HistoryTab />
+        <HistoryTab dataRefreshKey={dataRefreshKey} />
       </div>
 
       {/* Ingest tab (file import + beacon entry) */}
@@ -168,13 +181,47 @@ export function VariationA({ schema, onSchemaRefresh }: VariationAProps) {
               );
             })}
           </div>
-          {ingestSubTab === 'file' && <IngestPage onIngestComplete={onSchemaRefresh} />}
+          {ingestSubTab === 'file' && <IngestPage onIngestComplete={() => { onSchemaRefresh?.(); bumpDataRefresh(); }} />}
           {ingestSubTab === 'beacon' && <BeaconEntryTab schema={schema} />}
         </div>
       )}
 
+      {/* Management — reached from Settings, not the nav strip */}
+      {navTab === '__management__' && (
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            height: 28, padding: '0 12px', flexShrink: 0,
+            borderBottom: `1px solid ${C.borderSubtle}`,
+            backgroundColor: C.bgApp,
+          }}>
+            <div
+              onClick={() => setNavTab('__settings__')}
+              style={{
+                fontSize: 11, fontFamily: C.fontMono, color: C.textMuted, cursor: 'pointer',
+              }}
+            >
+              ← Settings
+            </div>
+            <span style={{ color: C.borderStrong }}>/</span>
+            <span style={{ fontSize: 11, fontFamily: C.fontMono, color: C.textPrimary }}>Management</span>
+          </div>
+          <ManagementPage schema={schema} onSchemaRefresh={onSchemaRefresh} onDataRefresh={bumpDataRefresh} />
+        </div>
+      )}
+
+      {/* Settings tab */}
+      {navTab === '__settings__' && <SettingsPage onOpenManagement={() => setNavTab('__management__')} />}
+
+      {/* Reports tab */}
+      {navTab === '__reports__' && (
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+          <GenerateReportsPage schema={schema} />
+        </div>
+      )}
+
       {/* 3-pane area */}
-      {navTab !== '__dashboard__' && navTab !== '__ingest__' && navTab !== '__live__' && navTab !== '__params__' && (
+      {navTab !== '__dashboard__' && navTab !== '__db__' && navTab !== '__ingest__' && navTab !== '__live__' && navTab !== '__params__' && navTab !== '__reports__' && navTab !== '__management__' && navTab !== '__settings__' && (
         <div style={{ display: 'flex', flex: 1, minHeight: 0, padding: 12 }}>
           <div style={{
             display: 'flex', flex: 1, minHeight: 0,

@@ -5,11 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -n server,vite -c cyan,magenta \"tsx watch server/index.ts\" \"vite\"",
+    "verify": "tsc --noEmit",
     "build": "vite build",
+    "build:web": "vite build",
+    "build:server": "tsc --noEmit",
+    "build:all": "npm run build:server && npm run build:web",
+    "deploy:release": "bash scripts/release-deploy.sh",
     "preview": "vite preview",
     "server": "tsx server/index.ts",
     "start": "tsx server/index.ts",
-    "start:web": "tsx server/web.ts"
+    "start:web": "tsx server/web.ts",
+    "smoke:values": "tsx server/satelliteValuesSmoke.ts"
   },
   "dependencies": {
     "@types/multer": "^2.1.0",

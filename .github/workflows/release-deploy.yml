@@ -1,0 +1,77 @@
+name: Release Deploy
+
+on:
+  push:
+    branches:
+      - release
+
+concurrency:
+  group: maveric-release-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify-build:
+    name: Verify and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify TypeScript
+        run: npm run verify
+
+      - name: Build web UI
+        run: npm run build:web
+
+  deploy:
+    name: Deploy release host
+    runs-on: ubuntu-latest
+    needs: verify-build
+    env:
+      RELEASE_SSH_HOST: ${{ secrets.RELEASE_SSH_HOST }}
+      RELEASE_SSH_USER: ${{ secrets.RELEASE_SSH_USER }}
+      RELEASE_APP_DIR: ${{ secrets.RELEASE_APP_DIR }}
+      RELEASE_DEPLOY_ROLE: ${{ secrets.RELEASE_DEPLOY_ROLE }}
+      DATA_RESTART_CMD: ${{ secrets.MAVERIC_DATA_RESTART_CMD }}
+      WEB_RESTART_CMD: ${{ secrets.MAVERIC_WEB_RESTART_CMD }}
+    steps:
+      - name: Check deploy secrets
+        id: deploy_config
+        run: |
+          if [ -n "$RELEASE_SSH_HOST" ] && [ -n "$RELEASE_SSH_USER" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "SSH deploy secrets are not configured; verify/build completed only."
+          fi
+
+      - name: Checkout
+        if: steps.deploy_config.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        if: steps.deploy_config.outputs.enabled == 'true'
+        env:
+          RELEASE_SSH_KEY: ${{ secrets.RELEASE_SSH_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$RELEASE_SSH_KEY" > ~/.ssh/maveric_release_key
+          chmod 600 ~/.ssh/maveric_release_key
+          ssh-keyscan -H "$RELEASE_SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Run release deploy script
+        if: steps.deploy_config.outputs.enabled == 'true'
+        run: |
+          APP_DIR="${RELEASE_APP_DIR:-/opt/maveric/app}"
+          DEPLOY_ROLE="${RELEASE_DEPLOY_ROLE:-all}"
+          ssh -i ~/.ssh/maveric_release_key "$RELEASE_SSH_USER@$RELEASE_SSH_HOST" \
+            "cd '$APP_DIR' && git fetch origin release && git checkout release && git reset --hard origin/release && MAVERIC_DEPLOY_ROLE='$DEPLOY_ROLE' MAVERIC_DATA_RESTART_CMD='$DATA_RESTART_CMD' MAVERIC_WEB_RESTART_CMD='$WEB_RESTART_CMD' ./scripts/release-deploy.sh"

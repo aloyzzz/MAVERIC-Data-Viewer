@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
 import { C } from '../lib/colors';
+import { useTz, fmtMsTime } from '../lib/timezone';
 import type { Row } from '../types';
 import { useFramePackets } from '../hooks/useApi';
 
@@ -263,6 +264,44 @@ function decodeFloats(bytes: Uint8Array): number[] {
   return result;
 }
 
+function decodeMagTlm(bytes: Uint8Array): DecodedSection[] | null {
+  if (bytes.byteLength < 80) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const f = (i: number) => dv.getFloat32(i * 4, true);
+
+  const tsS = f(0);
+  const tsDisplay = isFinite(tsS) && tsS > 1e9
+    ? new Date(Math.round(tsS) * 1000).toISOString()
+    : tsS.toFixed(3);
+
+  const sections: DecodedSection[] = [
+    {
+      label: 'D_Mag',
+      rows: [
+        { k: 'timestamp', v: tsDisplay },
+        { k: 'x', v: `${f(1).toFixed(2)} uT` },
+        { k: 'y', v: `${f(2).toFixed(2)} uT` },
+        { k: 'z', v: `${f(3).toFixed(2)} uT` },
+      ],
+    },
+  ];
+
+  for (let m = 0; m < 4; m++) {
+    const base = 4 + m * 4;
+    sections.push({
+      label: `Mag ${m + 1}`,
+      rows: [
+        { k: 'x',    v: `${f(base).toFixed(2)} uT` },
+        { k: 'y',    v: `${f(base + 1).toFixed(2)} uT` },
+        { k: 'z',    v: `${f(base + 2).toFixed(2)} uT` },
+        { k: 'temp', v: `${f(base + 3).toFixed(2)} C` },
+      ],
+    });
+  }
+
+  return sections;
+}
+
 // ── File chunk parsing ────────────────────────────────────────────────────────
 
 interface FileChunk {
@@ -495,10 +534,7 @@ function PtypeBadge({ ptype, count }: { ptype: string; count?: number }) {
   );
 }
 
-function ts(ms: number) {
-  const d = new Date(ms);
-  return d.toISOString().slice(11, 23);
-}
+// ts() replaced by fmtMsTime(ms, tz) from timezone module at each call site
 
 function formatArgs(argsText: string): string {
   // Try to pretty-print JSON embedded in args
@@ -538,7 +574,7 @@ function DecodedSections({ sections }: { sections: BeaconSection[] | EpsSection[
   );
 }
 
-function BinaryPayload({ bytes, cmdId }: { bytes: Uint8Array; cmdId: string }) {
+function BinaryPayload({ bytes, cmdId, ptype }: { bytes: Uint8Array; cmdId: string; ptype: string }) {
   if (bytes.length === 0) return null;
 
   if (cmdId === 'tlm_beacon') {
@@ -551,29 +587,37 @@ function BinaryPayload({ bytes, cmdId }: { bytes: Uint8Array; cmdId: string }) {
     if (sections) return <DecodedSections sections={sections} />;
   }
 
-  if (cmdId === 'mag_tlm' && bytes.length >= 4) {
+  if (cmdId === 'mag_tlm' && bytes.length >= 80) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const tsS = dv.getFloat32(0, true);
-    const floats: number[] = [];
-    for (let i = 4; i + 4 <= bytes.byteLength; i += 4) floats.push(dv.getFloat32(i, true));
-    const tsIso = isFinite(tsS) && tsS > 1e9 ? new Date(Math.round(tsS) * 1000).toISOString() : null;
+    const f = (i: number) => dv.getFloat32(i * 4, true);
+    const tsS = f(0);
+    const tsIso = isFinite(tsS) && tsS > 1e9 ? new Date(Math.round(tsS) * 1000).toISOString() : tsS.toFixed(3);
+    const rows = [
+      ['d_mag_x', f(1), 'uT'], ['d_mag_y', f(2), 'uT'], ['d_mag_z', f(3), 'uT'],
+      ['mag1_x', f(4), 'uT'], ['mag1_y', f(5), 'uT'], ['mag1_z', f(6), 'uT'], ['mag1_temp', f(7), 'C'],
+      ['mag2_x', f(8), 'uT'], ['mag2_y', f(9), 'uT'], ['mag2_z', f(10), 'uT'], ['mag2_temp', f(11), 'C'],
+      ['mag3_x', f(12), 'uT'], ['mag3_y', f(13), 'uT'], ['mag3_z', f(14), 'uT'], ['mag3_temp', f(15), 'C'],
+      ['mag4_x', f(16), 'uT'], ['mag4_y', f(17), 'uT'], ['mag4_z', f(18), 'uT'], ['mag4_temp', f(19), 'C'],
+    ] as const;
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
         <span style={{ fontFamily: C.fontMono, fontSize: 10, color: C.textMuted }}>
-          <span style={{ color: C.textDisabled }}>time </span>
-          <span style={{ color: C.textPrimary }}>{tsIso ?? tsS.toFixed(0)}</span>
+          <span style={{ color: C.textDisabled }}>mag_timestamp </span>
+          <span style={{ color: C.textPrimary }}>{tsIso}</span>
         </span>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px 12px' }}>
-          {floats.map((f, i) => (
-            <span key={i} style={{ fontFamily: C.fontMono, fontSize: 10, color: C.textMuted }}>
-              <span style={{ color: C.textDisabled }}>f{i + 1} </span>
-              <span style={{ color: f !== 0 ? C.textPrimary : C.textDisabled }}>{f.toFixed(4)}</span>
+          {rows.map(([name, value, unit]) => (
+            <span key={name} style={{ fontFamily: C.fontMono, fontSize: 10, color: C.textMuted }}>
+              <span style={{ color: C.textDisabled }}>{name} </span>
+              <span style={{ color: value !== 0 ? C.textPrimary : C.textDisabled }}>{value.toFixed(2)} {unit}</span>
             </span>
           ))}
         </div>
       </div>
     );
   }
+
+  if (ptype === 'FILE' || cmdId.endsWith('_get_chunks')) return null;
 
   // For sensor float payloads
   const floats = decodeFloats(bytes);
@@ -603,6 +647,7 @@ function BinaryPayload({ bytes, cmdId }: { bytes: Uint8Array; cmdId: string }) {
 }
 
 function ExchangeCard({ exchange }: { exchange: Exchange }) {
+  const { tz } = useTz();
   const [expanded, setExpanded] = useState(false);
 
   // Parse inner hex only when the card is expanded -- keeps initial render cheap.
@@ -652,7 +697,7 @@ function ExchangeCard({ exchange }: { exchange: Exchange }) {
         onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = expanded ? 'rgba(255,255,255,0.03)' : 'transparent'; }}
       >
         <span style={{ color: C.textDisabled, fontSize: 10, fontFamily: C.fontMono, flexShrink: 0 }}>
-          {ts(exchange.ts)}
+          {fmtMsTime(exchange.ts, tz)}
         </span>
 
         <span style={{ fontSize: 12, fontFamily: C.fontMono, color: C.textPrimary, flexShrink: 0 }}>
@@ -777,7 +822,7 @@ function ExchangeCard({ exchange }: { exchange: Exchange }) {
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: p && (p.argsText || p.isBinary) ? 6 : 0 }}>
                   <PtypeBadge ptype={pkt.ptype} />
                   <span style={{ fontSize: 10, color: C.textDisabled, fontFamily: C.fontMono }}>
-                    {ts(pkt.ts)}
+                    {fmtMsTime(pkt.ts, tz)}
                   </span>
                   <span style={{ fontSize: 10, color: C.textMuted, fontFamily: C.fontMono }}>
                     {pkt.src} → {pkt.dst}
@@ -817,7 +862,7 @@ function ExchangeCard({ exchange }: { exchange: Exchange }) {
                 )}
 
                 {p && p.isBinary && p.argsBytes.length > 0 && (
-                  <BinaryPayload bytes={p.argsBytes} cmdId={pkt.cmdId} />
+                  <BinaryPayload bytes={p.argsBytes} cmdId={pkt.cmdId} ptype={pkt.ptype} />
                 )}
               </div>
             );
@@ -834,6 +879,10 @@ interface ServerFile {
   filename: string;
   totalBytes: number;
   chunkCount: number;
+  fileKind?: string;
+  mimeType?: string;
+  relativePath?: string;
+  downloadUrl?: string;
 }
 
 function FileRow({ file, tableId }: { file: ServerFile; tableId: string }) {
@@ -841,7 +890,7 @@ function FileRow({ file, tableId }: { file: ServerFile; tableId: string }) {
   const [imgVisible, setImgVisible] = useState(false);
   const mime = mimeForFilename(file.filename);
   const typeLabel = mime.split('/')[1]?.toUpperCase().replace('JPEG', 'JPG') ?? 'BIN';
-  const dlUrl = `/api/tables/${tableId}/assembled-files/${encodeURIComponent(file.filename)}`;
+  const dlUrl = file.downloadUrl ?? `/api/tables/${tableId}/assembled-files/${encodeURIComponent(file.filename)}`;
 
   return (
     <div style={{ borderBottom: `1px solid ${C.borderSubtle}`, padding: '9px 14px' }}>
@@ -875,6 +924,17 @@ function FileRow({ file, tableId }: { file: ServerFile; tableId: string }) {
         {file.chunkCount > 0 && (
           <span style={{ fontFamily: C.fontMono, fontSize: 10, color: C.textDisabled, flexShrink: 0 }}>
             {file.chunkCount} chunk{file.chunkCount !== 1 ? 's' : ''}
+          </span>
+        )}
+        {file.relativePath && (
+          <span
+            title={file.relativePath}
+            style={{
+              fontFamily: C.fontMono, fontSize: 10, color: C.textDisabled,
+              flex: '0 1 220px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}
+          >
+            {file.relativePath}
           </span>
         )}
         <a
@@ -1058,17 +1118,8 @@ function buildTimeline(exchanges: Exchange[]): TimelineEntry[] {
         sections = decodeTlmBeacon(argsBytes);
       } else if (cmdId === 'eps_hk') {
         sections = decodeEpsHk(argsBytes);
-      } else if (cmdId === 'mag_tlm' && argsBytes.length >= 4) {
-        const dv = new DataView(argsBytes.buffer, argsBytes.byteOffset, argsBytes.byteLength);
-        const tsF = dv.getFloat32(0, true);
-        const tsIso = isFinite(tsF) && tsF > 1e9
-          ? new Date(Math.round(tsF) * 1000).toISOString()
-          : tsF.toFixed(0);
-        const rows: { k: string; v: string }[] = [{ k: 'time', v: tsIso }];
-        for (let i = 4; i + 4 <= argsBytes.byteLength; i += 4) {
-          rows.push({ k: `f${(i - 4) / 4 + 1}`, v: dv.getFloat32(i, true).toFixed(4) });
-        }
-        sections = [{ label: 'Magnetometer', rows }];
+      } else if (cmdId === 'mag_tlm') {
+        sections = decodeMagTlm(argsBytes);
       }
     } else if (argsText) {
       sections = parseTextSections(argsText);
@@ -1086,6 +1137,7 @@ function TimeSeriesPlot({ points, unit }: {
   points: { ts: number; val: number }[];
   unit: string;
 }) {
+  const { tz } = useTz();
   const W = 252, H = 130;
   const PAD = { t: 14, r: 8, b: 26, l: 56 };
   const pw = W - PAD.l - PAD.r;
@@ -1148,10 +1200,10 @@ function TimeSeriesPlot({ points, unit }: {
       ))}
       {/* X labels */}
       <text x={PAD.l} y={H - 4} textAnchor="start" fontSize={7} fill={C.textDisabled} fontFamily="monospace">
-        {new Date(tsMin).toISOString().slice(11, 19)}
+        {fmtMsTime(tsMin, tz)}
       </text>
       <text x={PAD.l + pw} y={H - 4} textAnchor="end" fontSize={7} fill={C.textDisabled} fontFamily="monospace">
-        {new Date(tsMax).toISOString().slice(11, 19)}
+        {fmtMsTime(tsMax, tz)}
       </text>
       {/* Unit label */}
       {unit && (
@@ -1173,6 +1225,7 @@ function splitNumericValue(raw: string): { num: number; unit: string } | null {
 }
 
 export function TelemetryTab({ tableId, defaultCmd, sourceFile }: { tableId: string; defaultCmd?: string; sourceFile?: string }) {
+  const { tz } = useTz();
   const { rows, loading } = useFramePackets(tableId);
   const [selectedCmd, setSelectedCmd] = useState<string | null>(defaultCmd ?? null);
   const [selectedCol, setSelectedCol] = useState<string | null>(null);
@@ -1513,7 +1566,7 @@ export function TelemetryTab({ tableId, defaultCmd, sourceFile }: { tableId: str
                       position: 'sticky', left: 0, zIndex: 1,
                       backgroundColor: C.bgPanel,
                     }}>
-                      {ts(row.ts)}
+                      {fmtMsTime(row.ts, tz)}
                     </td>
                     {colNames.map(col => {
                       const val = row.fields.get(col);

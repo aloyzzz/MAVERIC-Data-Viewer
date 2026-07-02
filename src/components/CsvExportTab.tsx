@@ -1,4 +1,4 @@
-import { useState, useMemo, CSSProperties } from 'react';
+import { useState, useMemo, useEffect, CSSProperties } from 'react';
 import { C } from '../lib/colors';
 import type { AppSchema, Row } from '../types';
 import { applyFilter, exportCsv } from '../lib/dataUtils';
@@ -108,6 +108,7 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
 
   /* batch mode */
   const [batchMode, setBatchMode] = useState(false);
+  const [analysisMode, setAnalysisMode] = useState(false);
   const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set());
   const [batchLoading, setBatchLoading] = useState(false);
 
@@ -121,6 +122,16 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
   const [paramFilter, setParamFilter]     = useState('');
   const [passIdFrom, setPassIdFrom]       = useState('');
   const [passIdTo, setPassIdTo]           = useState('');
+
+  /* analysis export */
+  const [analysisFormat, setAnalysisFormat] = useState<'long' | 'wide'>('long');
+  const [analysisDomain, setAnalysisDomain] = useState('');
+  const [analysisCmd, setAnalysisCmd] = useState('');
+  const [analysisParam, setAnalysisParam] = useState('');
+  const [analysisNumericOnly, setAnalysisNumericOnly] = useState(false);
+  const [analysisRows, setAnalysisRows] = useState<Row[]>([]);
+  const [analysisSummary, setAnalysisSummary] = useState<{ totalRows: number; numericRows: number; parameters: number } | null>(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
 
   /* fetch rows for selected table */
   const { rows: allRows, loading } = useTableRows(selectedTableId, 10000);
@@ -154,6 +165,46 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
     if (!isFinite(lo)) return null;
     return { lo, hi };
   }, [allRows, hasPassId, loading]);
+
+  const analysisQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    const fromId = Number(passIdFrom.trim());
+    const toId = Number(passIdTo.trim());
+    const passIds = schema.schemas
+      .find((s) => s.name === 'passes')?.tables
+      .map((t) => Number(/^pass_(\d+)$/.exec(t.id)?.[1]))
+      .filter((id) => Number.isFinite(id))
+      .filter((id) => (isNaN(fromId) || id >= fromId) && (isNaN(toId) || id <= toId)) ?? [];
+    if (passIds.length > 0) params.set('passIds', passIds.join(','));
+    if (tsFrom) params.set('from', String(new Date(tsFrom).getTime()));
+    if (tsTo) params.set('to', String(new Date(tsTo).getTime()));
+    if (analysisDomain.trim()) params.set('domain', analysisDomain.trim());
+    if (analysisCmd.trim()) params.set('cmd', analysisCmd.trim());
+    if (analysisParam.trim()) params.set('parameter', analysisParam.trim());
+    if (analysisNumericOnly) params.set('numericOnly', '1');
+    return params;
+  }, [schema.schemas, passIdFrom, passIdTo, tsFrom, tsTo, analysisDomain, analysisCmd, analysisParam, analysisNumericOnly]);
+
+  useEffect(() => {
+    if (!analysisMode) return;
+    const controller = new AbortController();
+    setAnalysisLoading(true);
+    const valuesParams = new URLSearchParams(analysisQuery);
+    valuesParams.set('limit', '20');
+    Promise.all([
+      fetch(`/api/values/summary?${analysisQuery.toString()}`, { signal: controller.signal })
+        .then((r) => r.json() as Promise<{ totalRows: number; numericRows: number; parameters: number }>),
+      fetch(`/api/values?${valuesParams.toString()}`, { signal: controller.signal })
+        .then((r) => r.json() as Promise<Record<string, unknown>[]>),
+    ]).then(([summary, rows]) => {
+      setAnalysisSummary(summary);
+      setAnalysisRows(rows.map((r, i) => ({ ...r, __idx: i })));
+      setAnalysisLoading(false);
+    }).catch(() => {
+      if (!controller.signal.aborted) setAnalysisLoading(false);
+    });
+    return () => controller.abort();
+  }, [analysisMode, analysisQuery]);
 
   /* unique parameter names */
   const paramNames = useMemo(() => {
@@ -214,6 +265,12 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
     exportCsv(filtered, activeColumns, `${selectedTableId}_export.csv`);
   };
 
+  const handleAnalysisDownload = () => {
+    const params = new URLSearchParams(analysisQuery);
+    params.set('format', analysisFormat);
+    window.location.href = `/api/values/export?${params.toString()}`;
+  };
+
   const handleBatchDownload = async () => {
     setBatchLoading(true);
     for (const tid of Array.from(batchSelected)) {
@@ -252,15 +309,18 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
             padding: '8px 12px', borderBottom: `1px solid ${C.borderSubtle}`,
             display: 'flex', gap: 4,
           }}>
-            {(['single', 'batch'] as const).map((m) => (
+            {(['single', 'batch', 'analysis'] as const).map((m) => (
               <button
                 key={m}
-                onClick={() => setBatchMode(m === 'batch')}
+                onClick={() => {
+                  setBatchMode(m === 'batch');
+                  setAnalysisMode(m === 'analysis');
+                }}
                 style={{
                   flex: 1, padding: '4px 0', fontSize: 10.5, fontFamily: C.fontMono,
-                  backgroundColor: (m === 'batch') === batchMode ? C.activeFill : C.bgPanelRaised,
-                  color: (m === 'batch') === batchMode ? C.active : C.textMuted,
-                  border: `1px solid ${(m === 'batch') === batchMode ? C.active + '55' : C.borderSubtle}`,
+                  backgroundColor: (m === 'analysis' ? analysisMode : (m === 'batch') === batchMode && !analysisMode) ? C.activeFill : C.bgPanelRaised,
+                  color: (m === 'analysis' ? analysisMode : (m === 'batch') === batchMode && !analysisMode) ? C.active : C.textMuted,
+                  border: `1px solid ${(m === 'analysis' ? analysisMode : (m === 'batch') === batchMode && !analysisMode) ? C.active + '55' : C.borderSubtle}`,
                   borderRadius: 3, cursor: 'pointer',
                 }}
               >
@@ -329,7 +389,7 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
           </div>
 
           {/* batch download button */}
-          {batchMode && (
+          {batchMode && !analysisMode && (
             <div style={{ borderTop: `1px solid ${C.borderSubtle}`, padding: 10 }}>
               <div style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled, marginBottom: 6 }}>
                 {batchSelected.size} table{batchSelected.size !== 1 ? 's' : ''} selected
@@ -357,7 +417,155 @@ export function CsvExportTab({ schema, embedded = false }: CsvExportTabProps) {
         </div>
 
         {/* ── MAIN PANEL ───────────────────────────────────────────────── */}
-        {!batchMode && (
+        {analysisMode && (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+            <div style={{
+              padding: '6px 16px', borderBottom: `1px solid ${C.borderStrong}`,
+              display: 'flex', alignItems: 'center', gap: 10,
+              backgroundColor: C.bgPanel, flexShrink: 0,
+            }}>
+              <span style={{ fontSize: 9.5, fontFamily: C.fontMono, textTransform: 'uppercase', letterSpacing: '0.1em', color: C.textMuted }}>analysis export</span>
+              <span style={{ fontSize: 13, fontFamily: C.fontMono, color: C.textPrimary }}>satellite_values</span>
+              {analysisLoading && <span style={{ marginLeft: 'auto', fontSize: 10.5, color: C.active, fontFamily: C.fontMono }}>loading…</span>}
+            </div>
+
+            <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+              <div style={{
+                width: 300, flexShrink: 0,
+                borderRight: `1px solid ${C.borderSubtle}`,
+                display: 'flex', flexDirection: 'column',
+                overflow: 'auto',
+              }}>
+                <ConfigSection label="csv format">
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {(['long', 'wide'] as const).map((fmt) => (
+                      <button
+                        key={fmt}
+                        onClick={() => setAnalysisFormat(fmt)}
+                        style={{
+                          flex: 1, padding: '5px 0',
+                          fontSize: 10.5, fontFamily: C.fontMono,
+                          borderRadius: 3, cursor: 'pointer',
+                          backgroundColor: analysisFormat === fmt ? C.activeFill : C.bgApp,
+                          color: analysisFormat === fmt ? C.active : C.textMuted,
+                          border: `1px solid ${analysisFormat === fmt ? C.active + '55' : C.borderSubtle}`,
+                        }}
+                      >
+                        {fmt}
+                      </button>
+                    ))}
+                  </div>
+                </ConfigSection>
+
+                <ConfigSection label="pass range">
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                    <div>
+                      <FieldLabel>from pass</FieldLabel>
+                      <input value={passIdFrom} onChange={(e) => setPassIdFrom(e.target.value)} placeholder="min" style={inputStyle} />
+                    </div>
+                    <div>
+                      <FieldLabel>to pass</FieldLabel>
+                      <input value={passIdTo} onChange={(e) => setPassIdTo(e.target.value)} placeholder="max" style={inputStyle} />
+                    </div>
+                  </div>
+                </ConfigSection>
+
+                <ConfigSection label="time range">
+                  <FieldLabel>from</FieldLabel>
+                  <input type="datetime-local" value={tsFrom} onChange={(e) => setTsFrom(e.target.value)} style={inputStyle} />
+                  <div style={{ height: 6 }} />
+                  <FieldLabel>to</FieldLabel>
+                  <input type="datetime-local" value={tsTo} onChange={(e) => setTsTo(e.target.value)} style={inputStyle} />
+                </ConfigSection>
+
+                <ConfigSection label="value filters">
+                  <FieldLabel>domain</FieldLabel>
+                  <input value={analysisDomain} onChange={(e) => setAnalysisDomain(e.target.value)} placeholder="eps, gnc, spacecraft…" style={inputStyle} />
+                  <div style={{ height: 6 }} />
+                  <FieldLabel>command/source</FieldLabel>
+                  <input value={analysisCmd} onChange={(e) => setAnalysisCmd(e.target.value)} placeholder="eps_hk, tlm_beacon…" style={inputStyle} />
+                  <div style={{ height: 6 }} />
+                  <FieldLabel>parameter</FieldLabel>
+                  <input value={analysisParam} onChange={(e) => setAnalysisParam(e.target.value)} placeholder="I_BUS, RATE, STAT…" style={inputStyle} />
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 10, fontSize: 10.5, fontFamily: C.fontMono, color: C.textMuted }}>
+                    <input type="checkbox" checked={analysisNumericOnly} onChange={(e) => setAnalysisNumericOnly(e.target.checked)} style={{ accentColor: C.active }} />
+                    numeric only
+                  </label>
+                </ConfigSection>
+              </div>
+
+              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+                <div style={{
+                  padding: '7px 16px', borderBottom: `1px solid ${C.borderSubtle}`,
+                  display: 'flex', alignItems: 'center', gap: 20,
+                  backgroundColor: C.bgApp, flexShrink: 0, flexWrap: 'wrap',
+                }}>
+                  <StatPill label="matched rows" value={(analysisSummary?.totalRows ?? 0).toLocaleString()} highlight />
+                  <StatPill label="numeric rows" value={(analysisSummary?.numericRows ?? 0).toLocaleString()} />
+                  <StatPill label="parameters" value={(analysisSummary?.parameters ?? 0).toLocaleString()} />
+                  <StatPill label="format" value={analysisFormat} />
+                </div>
+
+                <div style={{ flex: 1, overflow: 'auto', padding: '12px 16px' }}>
+                  <div style={{ fontSize: 9.5, fontFamily: C.fontMono, color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+                    preview — first {analysisRows.length} rows
+                  </div>
+                  {analysisRows.length === 0 ? (
+                    <div style={{ padding: 24, textAlign: 'center', color: C.textDisabled, fontFamily: C.fontMono, fontSize: 11 }}>
+                      {analysisLoading ? 'loading values…' : 'no satellite values match the current filters'}
+                    </div>
+                  ) : (
+                    <div style={{ overflow: 'auto', border: `1px solid ${C.borderSubtle}`, borderRadius: 4 }}>
+                      <table style={{ borderCollapse: 'collapse', fontSize: 10.5, fontFamily: C.fontMono, width: '100%', minWidth: 'max-content' }}>
+                        <thead>
+                          <tr style={{ backgroundColor: C.bgApp }}>
+                            {['ts_iso', 'pass_id', 'cmd_id', 'ptype', 'domain', 'field_path', 'value_text', 'value_numeric', 'unit'].map((col) => (
+                              <th key={col} style={{ padding: '4px 12px', textAlign: 'left', borderBottom: `1px solid ${C.borderStrong}`, color: C.textMuted, fontWeight: 'normal', whiteSpace: 'nowrap', borderRight: `1px solid ${C.borderSubtle}` }}>
+                                {col}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {analysisRows.map((row) => (
+                            <tr key={row.__idx} style={{ borderBottom: `1px solid ${C.borderSubtle}` }}>
+                              {['ts_iso', 'pass_id', 'cmd_id', 'ptype', 'domain', 'field_path', 'value_text', 'value_numeric', 'unit'].map((col) => (
+                                <td key={col} style={{ padding: '3px 12px', color: C.textSecondary, whiteSpace: 'nowrap', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', borderRight: `1px solid ${C.borderSubtle}` }}>
+                                  {String(row[col] ?? '')}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ padding: '10px 16px', borderTop: `1px solid ${C.borderStrong}`, display: 'flex', alignItems: 'center', gap: 12, backgroundColor: C.bgApp, flexShrink: 0 }}>
+                  <button
+                    onClick={handleAnalysisDownload}
+                    disabled={(analysisSummary?.totalRows ?? 0) === 0 || analysisLoading}
+                    style={{
+                      padding: '7px 22px', fontSize: 12.5, fontFamily: C.fontMono,
+                      fontWeight: 700, borderRadius: 4, border: 'none',
+                      backgroundColor: (analysisSummary?.totalRows ?? 0) > 0 && !analysisLoading ? C.active : C.bgPanelRaised,
+                      color: (analysisSummary?.totalRows ?? 0) > 0 && !analysisLoading ? C.bgApp : C.textDisabled,
+                      cursor: (analysisSummary?.totalRows ?? 0) > 0 && !analysisLoading ? 'pointer' : 'not-allowed',
+                    }}
+                  >
+                    download {analysisFormat} CSV
+                  </button>
+                  <span style={{ fontSize: 10.5, fontFamily: C.fontMono, color: C.textDisabled }}>
+                    exported from canonical satellite_values
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!batchMode && !analysisMode && (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
 
             {/* title bar */}

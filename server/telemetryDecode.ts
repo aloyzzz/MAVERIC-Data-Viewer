@@ -1,6 +1,8 @@
 // Server-side telemetry decode logic (mirrors DecodedFramesTab.tsx client decode).
 // Uses Node.js Buffer instead of DataView/Uint8Array.
 
+import { decodeWithMissionCatalog } from './missionCatalog.js';
+
 export interface DecodedField {
   field: string;
   value: string;
@@ -153,14 +155,50 @@ function decodeEpsHk(b: Buffer): DecodedField[] | null {
 }
 
 function decodeMagTlm(b: Buffer): DecodedField[] | null {
-  if (b.length < 8) return null;
-  const tsS = b.readFloatLE(0);
-  const fields: DecodedField[] = [
-    { field: 'timestamp_s', value: String(tsS), unit: 's' },
+  if (b.length < 80) return null;
+  const f = (i: number) => b.readFloatLE(i * 4);
+  return [
+    { field: 'mag_timestamp', value: String(Number(f(0).toFixed(6))), unit: 's'  },
+    { field: 'd_mag_x',     value: f(1).toFixed(2),  unit: 'uT' },
+    { field: 'd_mag_y',     value: f(2).toFixed(2),  unit: 'uT' },
+    { field: 'd_mag_z',     value: f(3).toFixed(2),  unit: 'uT' },
+    { field: 'mag1_x',      value: f(4).toFixed(2),  unit: 'uT' },
+    { field: 'mag1_y',      value: f(5).toFixed(2),  unit: 'uT' },
+    { field: 'mag1_z',      value: f(6).toFixed(2),  unit: 'uT' },
+    { field: 'mag1_temp',   value: f(7).toFixed(2),  unit: 'C'  },
+    { field: 'mag2_x',      value: f(8).toFixed(2),  unit: 'uT' },
+    { field: 'mag2_y',      value: f(9).toFixed(2),  unit: 'uT' },
+    { field: 'mag2_z',      value: f(10).toFixed(2), unit: 'uT' },
+    { field: 'mag2_temp',   value: f(11).toFixed(2), unit: 'C'  },
+    { field: 'mag3_x',      value: f(12).toFixed(2), unit: 'uT' },
+    { field: 'mag3_y',      value: f(13).toFixed(2), unit: 'uT' },
+    { field: 'mag3_z',      value: f(14).toFixed(2), unit: 'uT' },
+    { field: 'mag3_temp',   value: f(15).toFixed(2), unit: 'C'  },
+    { field: 'mag4_x',      value: f(16).toFixed(2), unit: 'uT' },
+    { field: 'mag4_y',      value: f(17).toFixed(2), unit: 'uT' },
+    { field: 'mag4_z',      value: f(18).toFixed(2), unit: 'uT' },
+    { field: 'mag4_temp',   value: f(19).toFixed(2), unit: 'C'  },
   ];
-  for (let i = 4; i + 4 <= b.length; i += 4) {
-    fields.push({ field: `f${(i - 4) / 4 + 1}`, value: b.readFloatLE(i).toFixed(4), unit: '' });
+}
+
+function decodeFileChunk(b: Buffer): DecodedField[] {
+  let pos = 0;
+  const tokens: string[] = [];
+  while (tokens.length < 3 && pos < b.length) {
+    while (pos < b.length && b[pos] === 0x20) pos++;
+    if (pos >= b.length || b[pos] < 0x21 || b[pos] > 0x7e) break;
+    let end = pos;
+    while (end < b.length && b[end] !== 0x20 && b[end] >= 0x20 && b[end] <= 0x7e) end++;
+    tokens.push(b.subarray(pos, end).toString('ascii'));
+    pos = end;
   }
+
+  if (tokens.length < 2) return [];
+  const chunkIdx = Number(tokens[1]);
+  const chunkLen = tokens.length >= 3 ? Number(tokens[2]) : Math.max(0, b.length - pos);
+  const fields: DecodedField[] = [{ field: 'filename', value: tokens[0], unit: '' }];
+  if (Number.isFinite(chunkIdx)) fields.push({ field: 'chunk_idx', value: String(chunkIdx), unit: '' });
+  if (Number.isFinite(chunkLen)) fields.push({ field: 'chunk_len', value: String(chunkLen), unit: 'bytes' });
   return fields;
 }
 
@@ -208,12 +246,16 @@ function parseTextDecoded(argsText: string): DecodedField[] {
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 // Decode one TLM/RES row's inner_hex into a list of named fields.
-export function decodeRow(cmdId: string, innerHex: string): DecodedField[] {
+export function decodeRow(cmdId: string, innerHex: string, ptype = ''): DecodedField[] {
   const parsed = parseInnerHex(innerHex);
   if (!parsed) return [];
   const { argsBytes, argsText } = parsed;
 
+  const catalogDecoded = decodeWithMissionCatalog(cmdId, ptype, argsBytes, argsText);
+  if (catalogDecoded.length > 0) return catalogDecoded;
+
   if (!argsText && argsBytes.length > 0) {
+    if (ptype === 'FILE' || cmdId.endsWith('_get_chunks')) return decodeFileChunk(argsBytes);
     if (cmdId === 'tlm_beacon') return decodeTlmBeacon(argsBytes) ?? [];
     if (cmdId === 'eps_hk')    return decodeEpsHk(argsBytes)    ?? [];
     if (cmdId === 'mag_tlm')   return decodeMagTlm(argsBytes)   ?? [];

@@ -38,11 +38,44 @@ export function DetailPane({ row, columns, table, onClose, onPassDeleted, positi
   const [passwordInput, setPasswordInput] = useState('');
   const [deleteError, setDeleteError] = useState('');
   const [deleting, setDeleting] = useState(false);
+  const [deleteFiles, setDeleteFiles] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
+
+  // Collapsed rail: a thin strip with an expand control, only for the side pane.
+  if (collapsed && position === 'right') {
+    return (
+      <div style={{
+        flex: '0 0 34px',
+        borderLeft: `1px solid ${C.borderSubtle}`,
+        backgroundColor: C.bgPanel,
+        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
+        padding: '8px 0',
+      }}>
+        <button
+          onClick={() => setCollapsed(false)}
+          title="expand row inspector"
+          style={{
+            background: 'transparent', border: `1px solid ${C.borderSubtle}`,
+            color: C.active, cursor: 'pointer', borderRadius: 3,
+            width: 22, height: 22, fontSize: 12, lineHeight: 1,
+          }}
+        >◀</button>
+        <span style={{
+          writingMode: 'vertical-rl', transform: 'rotate(180deg)',
+          fontSize: 9.5, fontFamily: C.fontMono, letterSpacing: '0.12em',
+          textTransform: 'uppercase', color: row ? C.active : C.textDisabled,
+        }}>
+          row inspector{row ? ` · #${(row.__idx + 1).toString().padStart(4, '0')}` : ''}
+        </span>
+      </div>
+    );
+  }
 
   if (!row) {
     return (
       <div style={{
         ...sizeStyle,
+        position: 'relative',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         backgroundColor: C.bgPanel,
         color: C.textDisabled,
@@ -51,6 +84,13 @@ export function DetailPane({ row, columns, table, onClose, onPassDeleted, positi
         textAlign: 'center',
         padding: 20,
       }}>
+        {position === 'right' && (
+          <button onClick={() => setCollapsed(true)} title="minimize inspector" style={{
+            position: 'absolute', top: 8, right: 8,
+            background: 'transparent', border: 0,
+            color: C.textDisabled, cursor: 'pointer', fontSize: 13, padding: '0 4px',
+          }}>▶</button>
+        )}
         <div>
           <div style={{ marginBottom: 8, fontSize: 28, opacity: 0.3 }}>▦</div>
           <div>select a row to inspect</div>
@@ -73,7 +113,7 @@ export function DetailPane({ row, columns, table, onClose, onPassDeleted, positi
       const resp = await fetch(`/api/passes/${deletePassId}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: passwordInput }),
+        body: JSON.stringify({ password: passwordInput, deleteFiles }),
       });
       if (!resp.ok) {
         const body = await resp.json() as { error?: string };
@@ -119,8 +159,14 @@ export function DetailPane({ row, columns, table, onClose, onPassDeleted, positi
         <span style={{ fontSize: 11, color: C.textMuted, fontFamily: C.fontMono }}>
           #{(row.__idx + 1).toString().padStart(4, '0')}
         </span>
-        <button onClick={onClose} style={{
-          marginLeft: 'auto', background: 'transparent', border: 0,
+        {position === 'right' && (
+          <button onClick={() => setCollapsed(true)} title="minimize inspector" style={{
+            marginLeft: 'auto', background: 'transparent', border: 0,
+            color: C.textDisabled, cursor: 'pointer', fontSize: 13, padding: '0 4px',
+          }}>▶</button>
+        )}
+        <button onClick={onClose} title="deselect row" style={{
+          marginLeft: position === 'right' ? 0 : 'auto', background: 'transparent', border: 0,
           color: C.textDisabled, cursor: 'pointer', fontSize: 14, padding: '0 4px',
         }}>×</button>
       </div>
@@ -176,7 +222,7 @@ export function DetailPane({ row, columns, table, onClose, onPassDeleted, positi
         <button style={btnStyle('info')}>Open FK</button>
         {showDeleteBtn && (
           <button
-            onClick={() => { setPasswordInput(''); setDeleteError(''); setShowDeleteModal(true); }}
+            onClick={() => { setPasswordInput(''); setDeleteError(''); setDeleteFiles(true); setShowDeleteModal(true); }}
             style={{ ...btnStyle('danger'), marginLeft: 'auto' }}
           >
             Delete Pass
@@ -208,6 +254,21 @@ export function DetailPane({ row, columns, table, onClose, onPassDeleted, positi
               This will permanently delete the pass, all its events, and all decoded telemetry.
               This action cannot be undone.
             </div>
+            <label style={{
+              display: 'flex', gap: 8, alignItems: 'flex-start',
+              color: C.textMuted, fontSize: 10.5, lineHeight: 1.4,
+              marginBottom: 14, cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={deleteFiles}
+                onChange={(e) => setDeleteFiles(e.target.checked)}
+                style={{ marginTop: 1 }}
+              />
+              <span>
+                Delete associated files from disk, including assembled FILE packet outputs and archived ingest JSONL.
+              </span>
+            </label>
             <div style={{ marginBottom: 8, color: C.textMuted, fontSize: 10.5 }}>Password</div>
             <input
               type="password"

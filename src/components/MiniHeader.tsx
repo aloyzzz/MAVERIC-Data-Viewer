@@ -1,14 +1,20 @@
 import { useState, useEffect } from 'react';
 import { C } from '../lib/colors';
+import { useTz, fmtNowDate, fmtNowTime, type Tz } from '../lib/timezone';
 
 export function MiniHeader() {
   const [now, setNow] = useState(() => new Date());
+  const { tz, setTz } = useTz();
+
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(id);
   }, []);
+
   const utcDate = now.toISOString().slice(0, 10);
   const utcTime = now.toISOString().slice(11, 19);
+  const pstDate = fmtNowDate(now, 'PST');
+  const pstTime = fmtNowTime(now, 'PST');
 
   return (
     <div style={{
@@ -40,11 +46,52 @@ export function MiniHeader() {
       </div>
 
       {/* Right cluster */}
-      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 10, fontFamily: C.fontMono, fontSize: 11 }}>
+      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 14, fontFamily: C.fontMono, fontSize: 11 }}>
+        {/* PST clock — always visible */}
+        <span style={{ color: C.textMuted }}>
+          {pstDate} {pstTime} <span style={{ color: C.textDisabled }}>PST</span>
+        </span>
+
+        <span style={{ color: C.borderStrong }}>|</span>
+
+        {/* UTC clock — always visible */}
         <span style={{ color: C.textPrimary }}>
           {utcDate} {utcTime} <span style={{ color: C.textDisabled }}>UTC</span>
         </span>
+
+        {/* Toggle */}
+        <TzToggle tz={tz} setTz={setTz} />
       </div>
+    </div>
+  );
+}
+
+function TzToggle({ tz, setTz }: { tz: Tz; setTz: (t: Tz) => void }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center',
+      border: `1px solid ${C.borderSubtle}`,
+      borderRadius: 4, overflow: 'hidden',
+      fontSize: 10.5, fontFamily: C.fontMono,
+    }}>
+      {(['UTC', 'PST'] as Tz[]).map((t) => (
+        <button
+          key={t}
+          onClick={() => setTz(t)}
+          style={{
+            padding: '2px 8px',
+            backgroundColor: tz === t ? C.active : 'transparent',
+            color: tz === t ? C.bgApp : C.textMuted,
+            border: 'none',
+            cursor: 'pointer',
+            fontFamily: C.fontMono,
+            fontSize: 10.5,
+            fontWeight: tz === t ? 700 : 400,
+          }}
+        >
+          {t}
+        </button>
+      ))}
     </div>
   );
 }
