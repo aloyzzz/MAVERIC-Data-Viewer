@@ -290,6 +290,41 @@ export async function initDb(): Promise<void> {
         ON pass_files (pass_id, file_kind, filename);
     `);
 
+    // Durable cross-pass chunk store. A single logical file may be downlinked
+    // as fragments spread across several passes; we key chunks by (filename,
+    // chunk_index) so ON CONFLICT DO NOTHING dedups across passes (first-wins)
+    // and re-ingest is idempotent. pass_id records which pass delivered a chunk.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS file_chunks (
+        filename    TEXT    NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        data        BYTEA   NOT NULL,
+        byte_len    INTEGER NOT NULL,
+        pass_id     INTEGER NOT NULL,
+        ts_ms       BIGINT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (filename, chunk_index)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fc_filename ON file_chunks (filename);
+    `);
+
+    // Reassembly status for each logical file, merged across all passes.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS merged_files (
+        filename            TEXT PRIMARY KEY,
+        status              TEXT NOT NULL,
+        received_chunks     INTEGER NOT NULL,
+        max_index           INTEGER NOT NULL,
+        total_bytes         BIGINT NOT NULL,
+        missing_ranges      TEXT NOT NULL DEFAULT '[]',
+        contributing_passes TEXT NOT NULL DEFAULT '[]',
+        mime_type           TEXT,
+        relative_path       TEXT NOT NULL,
+        download_url        TEXT NOT NULL,
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
     // Backfill any passes that have no decoded rows yet, and ensure each
     // per-pass table has a ts_ms index (the default sort column).
     const allPasses = (await client.query('SELECT pass_id FROM passes')).rows as { pass_id: number }[];
@@ -1495,6 +1530,10 @@ export async function deletePass(passId: number, options: { deleteFiles?: boolea
     await client.query('DELETE FROM decoded_telemetry WHERE pass_id = $1', [passId]);
     await client.query('DELETE FROM satellite_values WHERE pass_id = $1', [passId]);
     await client.query('DELETE FROM pass_files WHERE pass_id = $1', [passId]);
+    // Drop chunks this pass contributed to the cross-pass store. Chunks that
+    // also arrived in a surviving pass are refilled on the next
+    // assembleFilesAcrossPasses() re-ingest (first-wins insert).
+    await client.query('DELETE FROM file_chunks WHERE pass_id = $1', [passId]);
     await client.query('COMMIT');
     committed = true;
 
@@ -1757,6 +1796,217 @@ export async function assembleFilesForTable(tableId: string): Promise<AssembledF
     });
   }
   return results;
+}
+
+// ── Cross-pass reassembly ──────────────────────────────────────────────────────
+//
+// A single image can be too large to downlink in one satellite pass, so its
+// FILE chunks arrive spread across passes. These functions accumulate every
+// chunk ever seen into the durable file_chunks store, then reassemble each
+// logical file from the union of all passes. We always write a best-effort
+// concatenation (so a partial preview is viewable immediately) and separately
+// flag a file 'complete' only once its chunks are contiguous from index 0 and,
+// for known image types, its container markers validate.
+
+const MERGED_TABLE_ID = 'merged';
+
+interface MergedFileInfo {
+  filename: string;
+  status: 'complete' | 'partial';
+  receivedChunks: number;
+  maxIndex: number;
+  totalBytes: number;
+  missingRanges: [number, number][];
+  contributingPasses: number[];
+  mimeType: string;
+  relativePath: string;
+  downloadUrl: string;
+}
+
+function isImageFile(filename: string): boolean {
+  const m = mimeForFile(filename);
+  return m.startsWith('image/');
+}
+
+// Validate that a byte buffer is a structurally whole file of its declared
+// type by checking the container's leading signature and trailing marker. This
+// catches truncation (a missing tail chunk) without needing a chunk total in
+// the wire header, which the FILE protocol does not carry.
+function isStructurallyComplete(filename: string, buf: Buffer): boolean {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+    return buf.length >= 4
+      && buf[0] === 0xff && buf[1] === 0xd8               // SOI
+      && buf[buf.length - 2] === 0xff && buf[buf.length - 1] === 0xd9; // EOI
+  }
+  if (lower.endsWith('.png')) {
+    const sigOk = buf.length >= 8
+      && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+    const iendOk = buf.length >= 12
+      && buf.subarray(buf.length - 8, buf.length - 4).toString('ascii') === 'IEND';
+    return sigOk && iendOk;
+  }
+  if (lower.endsWith('.gif')) {
+    return buf.length >= 6
+      && buf.subarray(0, 3).toString('ascii') === 'GIF'
+      && buf[buf.length - 1] === 0x3b;                    // trailer
+  }
+  // Unknown type: we cannot validate the tail, so structure is inconclusive.
+  return false;
+}
+
+// Read FILE-type frames from one pass table and upsert their chunks into the
+// durable cross-pass store. Returns the count of newly inserted chunks.
+export async function ingestFileChunksFromTable(tableId: string): Promise<number> {
+  if (!/^\w+$/.test(tableId)) throw new Error('Invalid table name');
+  const passId = passIdFromTableId(tableId);
+  if (!passId) throw new Error('Invalid pass table name');
+
+  const res = await pool.query(`
+    SELECT inner_hex, ts_ms
+    FROM "${tableId}"
+    WHERE event_kind = 'rx_packet'
+      AND mission_facts_header_ptype = 'FILE'
+      AND inner_hex IS NOT NULL
+    ORDER BY ts_ms ASC
+  `);
+
+  let inserted = 0;
+  for (const row of res.rows as { inner_hex: string; ts_ms: number | null }[]) {
+    const argsBytes = parseInnerHexServer(row.inner_hex);
+    if (!argsBytes || argsBytes.length === 0) continue;
+    const chunk = parseFileChunkServer(argsBytes);
+    if (!chunk || chunk.data.length === 0) continue;
+    const r = await pool.query(`
+      INSERT INTO file_chunks (filename, chunk_index, data, byte_len, pass_id, ts_ms)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (filename, chunk_index) DO NOTHING
+    `, [chunk.filename, chunk.index, chunk.data, chunk.data.length, passId, row.ts_ms ?? null]);
+    inserted += r.rowCount ?? 0;
+  }
+  return inserted;
+}
+
+// Reassemble one logical file from every chunk seen across all passes.
+async function reassembleMergedFile(filename: string, outDir: string): Promise<MergedFileInfo | null> {
+  const rows = (await pool.query(`
+    SELECT chunk_index, data, byte_len, pass_id
+    FROM file_chunks
+    WHERE filename = $1
+    ORDER BY chunk_index ASC
+  `, [filename])).rows as { chunk_index: number; data: Buffer; byte_len: number; pass_id: number }[];
+  if (rows.length === 0) return null;
+
+  const present = new Set(rows.map(r => r.chunk_index));
+  const maxIndex = rows[rows.length - 1].chunk_index;
+
+  // Enumerate missing index ranges within [0, maxIndex].
+  const missingRanges: [number, number][] = [];
+  for (let i = 0; i <= maxIndex; i++) {
+    if (!present.has(i)) {
+      const start = i;
+      while (i <= maxIndex && !present.has(i)) i++;
+      missingRanges.push([start, i - 1]);
+    }
+  }
+
+  // Always write a best-effort concatenation of whatever we have so far. With
+  // gaps this image is byte-misaligned past the first gap, but it gives an
+  // immediate partial preview; the file is upgraded in place as later passes
+  // fill the holes.
+  const buf = Buffer.concat(rows.map(r => r.data));
+  const contiguous = missingRanges.length === 0;
+  const status: 'complete' | 'partial' =
+    contiguous && (isImageFile(filename) ? isStructurallyComplete(filename, buf) : true)
+      ? 'complete'
+      : 'partial';
+
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, filename), buf);
+
+  const contributingPasses = [...new Set(rows.map(r => r.pass_id))].sort((a, b) => a - b);
+  const relativePath = `assembled_files/${MERGED_TABLE_ID}/${filename}`;
+  const downloadUrl = fileDownloadUrl(MERGED_TABLE_ID, 'assembled', filename);
+  const mimeType = mimeForFile(filename);
+
+  await pool.query(`
+    INSERT INTO merged_files
+      (filename, status, received_chunks, max_index, total_bytes,
+       missing_ranges, contributing_passes, mime_type, relative_path, download_url)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    ON CONFLICT (filename) DO UPDATE SET
+      status = EXCLUDED.status,
+      received_chunks = EXCLUDED.received_chunks,
+      max_index = EXCLUDED.max_index,
+      total_bytes = EXCLUDED.total_bytes,
+      missing_ranges = EXCLUDED.missing_ranges,
+      contributing_passes = EXCLUDED.contributing_passes,
+      mime_type = EXCLUDED.mime_type,
+      relative_path = EXCLUDED.relative_path,
+      download_url = EXCLUDED.download_url,
+      updated_at = now()
+  `, [
+    filename, status, rows.length, maxIndex, buf.length,
+    JSON.stringify(missingRanges), JSON.stringify(contributingPasses),
+    mimeType, relativePath, downloadUrl,
+  ]);
+
+  return {
+    filename, status, receivedChunks: rows.length, maxIndex, totalBytes: buf.length,
+    missingRanges, contributingPasses, mimeType, relativePath, downloadUrl,
+  };
+}
+
+// Ingest chunks from every pass, then reassemble all known logical files.
+export async function assembleFilesAcrossPasses(): Promise<MergedFileInfo[]> {
+  const client = await pool.connect();
+  let passIds: number[];
+  try {
+    const passes = (await client.query('SELECT pass_id FROM passes ORDER BY pass_id')).rows as { pass_id: number }[];
+    passIds = [];
+    for (const { pass_id } of passes) {
+      if (await tableExists(client, `pass_${pass_id}`)) passIds.push(pass_id);
+    }
+  } finally {
+    client.release();
+  }
+
+  for (const passId of passIds) {
+    await ingestFileChunksFromTable(`pass_${passId}`);
+  }
+
+  const filenames = (await pool.query(
+    'SELECT DISTINCT filename FROM file_chunks ORDER BY filename ASC',
+  )).rows as { filename: string }[];
+
+  const outDir = join(FILES_DIR, MERGED_TABLE_ID);
+  const results: MergedFileInfo[] = [];
+  for (const { filename } of filenames) {
+    const info = await reassembleMergedFile(filename, outDir);
+    if (info) results.push(info);
+  }
+  return results;
+}
+
+export async function listMergedFiles(): Promise<MergedFileInfo[]> {
+  const res = await pool.query(`
+    SELECT filename, status, received_chunks, max_index, total_bytes,
+           missing_ranges, contributing_passes, mime_type, relative_path, download_url
+    FROM merged_files
+    ORDER BY filename ASC
+  `);
+  return (res.rows as Record<string, unknown>[]).map(r => ({
+    filename: String(r.filename),
+    status: r.status as 'complete' | 'partial',
+    receivedChunks: Number(r.received_chunks),
+    maxIndex: Number(r.max_index),
+    totalBytes: Number(r.total_bytes),
+    missingRanges: JSON.parse(String(r.missing_ranges)) as [number, number][],
+    contributingPasses: JSON.parse(String(r.contributing_passes)) as number[],
+    mimeType: String(r.mime_type ?? ''),
+    relativePath: String(r.relative_path),
+    downloadUrl: String(r.download_url),
+  }));
 }
 
 export async function listAssembledFiles(tableId: string): Promise<AssembledFileInfo[]> {

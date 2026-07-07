@@ -45,8 +45,6 @@ const LINE_COLORS = [
 
 const PASS_COLORS = LINE_COLORS;
 
-const DOMAIN_ORDER = ['spacecraft', 'gnc', 'eps', 'imaging', 'hk', 'ppm', 'cfg', 'params', 'other'];
-
 const CHART_GAP    = 8;
 const CHART_PAD    = 10;
 const GRID_CHART_H = 220;
@@ -93,21 +91,6 @@ function fmtCmd(cmd: string): string {
 
 function signalKey(cmdId: string, field: string): string {
   return `${cmdId}::${field}`;
-}
-
-function fieldDomain(cmdId: string, field: string, domainMap: Map<string, string>): string {
-  if (cmdId.startsWith('param:')) return domainMap.get(field) ?? 'params';
-  if (cmdId === 'eps_hk') return 'eps';
-  if (cmdId === 'mag_tlm') return 'gnc';
-  if (cmdId.includes('img') || cmdId.includes('cam')) return 'imaging';
-  if (cmdId.includes('ppm')) return 'ppm';
-  if (cmdId.includes('cfg')) return 'cfg';
-  if (cmdId === 'tlm_beacon') {
-    if (field.startsWith('eps_')) return 'eps';
-    if (['rate_x','rate_y','rate_z','mag_x','mag_y','mag_z','mtq_x','mtq_y','mtq_z','gnc_mode','adcs_tmp'].includes(field)) return 'gnc';
-    return 'spacecraft';
-  }
-  return 'other';
 }
 
 function isLikelyNumericSignal(f: SummaryRow): boolean {
@@ -401,7 +384,7 @@ export function HistoryTab({ dataRefreshKey = 0 }: { dataRefreshKey?: number }) 
 
   // Density filters for Signals tab
   const [densityFilter, setDensityFilter] = useState<Set<string>>(new Set(['numeric', 'hideFile']));
-  const [domainFilter, setDomainFilter] = useState<string>('all');
+  const [sourceFilter, setSourceFilter] = useState<string>('all');
   const [passListExpanded, setPassListExpanded] = useState(false);
   // Collapse the left control panel (pass scope + signals) into a thin rail
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -646,13 +629,15 @@ export function HistoryTab({ dataRefreshKey = 0 }: { dataRefreshKey?: number }) 
   }, [historyDataByCmd]);
 
   // Fields grouped by domain for the Signals panel
-  const fieldsByDomain = useMemo(() => {
+  // Group signals by their source command (the category the field was
+  // transmitted in, e.g. eps_hk, tlm_beacon, mag_tlm) rather than a
+  // generalised subsystem label.
+  const fieldsBySource = useMemo(() => {
     const q = fieldSearch.trim().toLowerCase();
     let shown = q
       ? availFields.filter(f =>
           f.field.toLowerCase().includes(q) ||
-          f.cmd_id.toLowerCase().includes(q) ||
-          fieldDomain(f.cmd_id, f.field, paramDomainMap).includes(q),
+          f.cmd_id.toLowerCase().includes(q),
         )
       : [...availFields];
     if (densityFilter.has('withUnit'))  shown = shown.filter(f => f.unit !== '');
@@ -660,26 +645,23 @@ export function HistoryTab({ dataRefreshKey = 0 }: { dataRefreshKey?: number }) 
     if (densityFilter.has('numeric'))   shown = shown.filter(isLikelyNumericSignal);
     if (densityFilter.has('hideFile'))  shown = shown.filter(f => !isFileSignal(f));
     if (densityFilter.has('changing'))  shown = shown.filter(f => !constantFields.has(signalKey(f.cmd_id, f.field)));
-    if (domainFilter !== 'all') shown = shown.filter(f => fieldDomain(f.cmd_id, f.field, paramDomainMap) === domainFilter);
+    if (sourceFilter !== 'all') shown = shown.filter(f => f.cmd_id === sourceFilter);
 
     const groups = new Map<string, SummaryRow[]>();
     for (const f of shown) {
-      const domain = fieldDomain(f.cmd_id, f.field, paramDomainMap);
-      if (!groups.has(domain)) groups.set(domain, []);
-      groups.get(domain)!.push(f);
+      if (!groups.has(f.cmd_id)) groups.set(f.cmd_id, []);
+      groups.get(f.cmd_id)!.push(f);
     }
-    // Return in canonical order
+    // Order groups by source command name for a stable, predictable layout.
     const ordered = new Map<string, SummaryRow[]>();
-    for (const d of DOMAIN_ORDER) if (groups.has(d)) ordered.set(d, groups.get(d)!);
-    for (const [d, fs] of groups) if (!ordered.has(d)) ordered.set(d, fs);
+    for (const cmd of [...groups.keys()].sort()) ordered.set(cmd, groups.get(cmd)!);
     return ordered;
-  }, [availFields, fieldSearch, densityFilter, domainFilter, paramDomainMap, constantFields]);
+  }, [availFields, fieldSearch, densityFilter, sourceFilter, paramDomainMap, constantFields]);
 
-  const availableDomains = useMemo(() => {
-    const s = new Set<string>();
-    for (const f of availFields) s.add(fieldDomain(f.cmd_id, f.field, paramDomainMap));
-    return DOMAIN_ORDER.filter(d => s.has(d)).concat([...s].filter(d => !DOMAIN_ORDER.includes(d)));
-  }, [availFields, paramDomainMap]);
+  const availableSources = useMemo(
+    () => [...new Set(availFields.map(f => f.cmd_id))].sort(),
+    [availFields],
+  );
 
   // Summary bar stats
   const summaryMinTs = useMemo(() => {
@@ -979,7 +961,7 @@ export function HistoryTab({ dataRefreshKey = 0 }: { dataRefreshKey?: number }) 
                     <button onClick={() => {
                       setFieldSelectionByCmd(prev => {
                         const next = new Map(prev);
-                        for (const fields of fieldsByDomain.values()) {
+                        for (const fields of fieldsBySource.values()) {
                           for (const f of fields) {
                             const cur = next.get(f.cmd_id) ?? new Set<string>();
                             cur.add(f.field);
@@ -998,12 +980,12 @@ export function HistoryTab({ dataRefreshKey = 0 }: { dataRefreshKey?: number }) 
                     }} style={microBtnStyle(false)}>none</button>
                   </div>
                 </div>
-                {availableDomains.length > 0 && (
+                {availableSources.length > 0 && (
                   <div style={{ padding: '5px 8px', borderBottom: `1px solid ${C.borderSubtle}`, display: 'flex', gap: 4, overflowX: 'auto', flexShrink: 0 }}>
-                    <button onClick={() => setDomainFilter('all')} style={microBtnStyle(domainFilter === 'all')}>all</button>
-                    {availableDomains.map(domain => (
-                      <button key={domain} onClick={() => setDomainFilter(domain)} style={microBtnStyle(domainFilter === domain)}>
-                        {domain}
+                    <button onClick={() => setSourceFilter('all')} style={microBtnStyle(sourceFilter === 'all')}>all</button>
+                    {availableSources.map(source => (
+                      <button key={source} onClick={() => setSourceFilter(source)} style={microBtnStyle(sourceFilter === source)}>
+                        {fmtCmd(source)}
                       </button>
                     ))}
                   </div>
@@ -1016,17 +998,17 @@ export function HistoryTab({ dataRefreshKey = 0 }: { dataRefreshKey?: number }) 
                   />
                 </div>
                 <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-                  {fieldsByDomain.size === 0 ? (
+                  {fieldsBySource.size === 0 ? (
                     <div style={{ padding: '10px 14px', fontSize: 10, fontFamily: C.fontMono, color: C.textDisabled }}>no matches</div>
-                  ) : [...fieldsByDomain.entries()].map(([domain, fields]) => (
-                    <div key={domain}>
+                  ) : [...fieldsBySource.entries()].map(([source, fields]) => (
+                    <div key={source}>
                       <div style={{
                         padding: '3px 12px', fontSize: 8.5, fontFamily: C.fontMono,
                         color: C.textDisabled, textTransform: 'uppercase', letterSpacing: '0.1em',
                         backgroundColor: C.bgApp, borderBottom: `1px solid ${C.borderSubtle}`,
                         display: 'flex', justifyContent: 'space-between',
                       }}>
-                        <span>{domain}</span>
+                        <span>{fmtCmd(source)}</span>
                         <span style={{ opacity: 0.6 }}>{fields.length}</span>
                       </div>
                       {fields.map((f, i) => (

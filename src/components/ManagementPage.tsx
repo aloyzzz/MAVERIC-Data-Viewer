@@ -72,6 +72,9 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
   const [valuesResults, setValuesResults] = useState<ReDecodeResult[]>([]);
   const [valuesError, setValuesError] = useState('');
 
+  const [backupPhase, setBackupPhase] = useState<Phase>('idle');
+  const [backupError, setBackupError] = useState('');
+
   const unlock = async () => {
     setUnlockError('');
     try {
@@ -143,6 +146,40 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
     } catch (err) {
       setValuesError(String(err));
       setValuesPhase('error');
+    }
+  };
+
+  const downloadBackup = async () => {
+    setBackupPhase('running');
+    setBackupError('');
+    try {
+      const res = await fetch('/api/management/backup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { error?: string };
+        setBackupError(body.error ?? `Backup failed (${res.status})`);
+        setBackupPhase('error');
+        return;
+      }
+      const blob = await res.blob();
+      const disp = res.headers.get('Content-Disposition') ?? '';
+      const match = /filename="?([^"]+)"?/.exec(disp);
+      const name = match?.[1] ?? `maveric-backup-${Date.now()}.tar.gz`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setBackupPhase('done');
+    } catch (err) {
+      setBackupError(String(err));
+      setBackupPhase('error');
     }
   };
 
@@ -247,6 +284,29 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
               )}
               {valuesPhase === 'error' && <div style={{ fontSize: 10.5, ...mono, color: C.danger, marginBottom: 8 }}>{valuesError}</div>}
               <ResultList results={valuesResults} />
+            </div>
+          </div>
+        </div>
+
+        <div style={{ backgroundColor: C.bgPanel, border: `1px solid ${C.borderSubtle}`, borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.borderSubtle}`, fontSize: 10.5, ...mono, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Backups
+          </div>
+          <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto', gap: 14, alignItems: 'start' }}>
+            <div>
+              <div style={{ fontSize: 12, ...mono, color: C.textPrimary, marginBottom: 4 }}>Download full backup</div>
+              <div style={{ fontSize: 11, ...mono, color: C.textMuted, lineHeight: 1.5 }}>
+                Builds a single `.tar.gz` containing a `pg_dump` of the database plus the `assembled_files/` and `ingested_jsonl/` directories. Restore on the server with `scripts/restore.sh &lt;backup.tar.gz&gt;`.
+              </div>
+            </div>
+            <button onClick={() => void downloadBackup()} disabled={backupPhase === 'running'} style={btnStyle('normal', backupPhase === 'running')}>
+              {backupPhase === 'running' ? 'Building...' : 'Create & Download'}
+            </button>
+            <div style={{ gridColumn: '1 / -1' }}>
+              {backupPhase === 'done' && (
+                <div style={{ fontSize: 10.5, ...mono, color: C.success }}>Backup downloaded.</div>
+              )}
+              {backupPhase === 'error' && <div style={{ fontSize: 10.5, ...mono, color: C.danger }}>{backupError}</div>}
             </div>
           </div>
         </div>

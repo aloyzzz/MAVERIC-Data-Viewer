@@ -1,10 +1,13 @@
 import { Router, type Response } from 'express';
-import { existsSync, statSync, openSync, readSync, closeSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, unlink } from 'fs';
+import { join, resolve } from 'path';
+import { tmpdir } from 'os';
+import { execFile } from 'child_process';
 import multer from 'multer';
 import {
   loadSchema, fetchRows, fetchFramePackets, ingestJsonl,
   assembleFilesForTable, listAssembledFiles, FILES_DIR, INGESTED_FILES_DIR,
+  assembleFilesAcrossPasses, listMergedFiles,
   materializeTelemetry, fetchDecodedSummary, fetchDecodedTelemetry, fetchDecodeStatus,
   deletePass, previewBeacons, insertBeacons, exportDatabase, fetchAllParameters,
   fetchParameterHistory, checkIngestHash,
@@ -114,6 +117,27 @@ router.get('/tables/:tableId/assembled-files', async (req, res) => {
   }
 });
 
+// Reassemble files from chunks pooled across every pass. Handles images too
+// large to downlink in a single pass. Served/downloaded via the existing
+// /tables/merged/assembled-files/:filename route.
+router.post('/files/assemble-cross-pass', async (_req, res) => {
+  try {
+    const files = await assembleFilesAcrossPasses();
+    res.json({ files });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.get('/files/cross-pass', async (_req, res) => {
+  try {
+    const files = await listMergedFiles();
+    res.json({ files });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 router.get('/tables/:tableId/assembled-files/:filename', (req, res) => {
   const { tableId, filename } = req.params;
   if (!/^\w+$/.test(tableId) || filename.includes('/') || filename.includes('..')) {
@@ -206,6 +230,24 @@ router.post('/history/redecode-all', async (_req, res) => {
 router.post('/management/unlock', (req, res) => {
   if (!requireManagementPassword(req.body, res)) return;
   res.json({ ok: true });
+});
+
+router.post('/management/backup', (req, res) => {
+  if (!requireManagementPassword(req.body, res)) return;
+  const script  = resolve(process.cwd(), 'scripts', 'backup.sh');
+  const outPath = join(tmpdir(), `maveric-backup-${Date.now()}.tar.gz`);
+  execFile('bash', [script, outPath], { cwd: process.cwd() }, (err, _stdout, stderr) => {
+    if (err) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: `Backup failed: ${stderr.trim() || err.message}` });
+      }
+      return;
+    }
+    const filename = `maveric-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.tar.gz`;
+    res.download(outPath, filename, () => {
+      unlink(outPath, () => { /* best-effort cleanup */ });
+    });
+  });
 });
 
 router.post('/management/redecode-all', async (req, res) => {
