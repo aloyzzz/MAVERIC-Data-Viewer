@@ -9,7 +9,7 @@ import {
   assembleFilesForTable, listAssembledFiles, FILES_DIR, INGESTED_FILES_DIR,
   assembleFilesAcrossPasses, listMergedFiles,
   materializeTelemetry, fetchDecodedSummary, fetchDecodedTelemetry, fetchDecodeStatus,
-  deletePass, previewBeacons, insertBeacons, exportDatabase, fetchAllParameters,
+  deletePass, clearAllData, previewBeacons, insertBeacons, exportDatabase, fetchAllParameters,
   fetchParameterHistory, checkIngestHash,
   fetchSatelliteValueSummary, fetchSatelliteValues, exportSatelliteValuesCsv,
   materializeSatelliteValuesForPasses,
@@ -269,6 +269,38 @@ router.post('/management/values/materialize', async (req, res) => {
   if (passIds.length === 0) { res.status(400).json({ error: 'passIds required' }); return; }
   try {
     res.json(await materializeSatelliteValuesForPasses(passIds));
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+router.post('/management/passes/delete', async (req, res) => {
+  if (!requireManagementPassword(req.body, res)) return;
+  const passIds: number[] = Array.isArray(req.body?.passIds)
+    ? req.body.passIds.map(Number).filter((n: number) => n > 0 && !isNaN(n))
+    : parsePassIds(req.body?.passIds);
+  if (passIds.length === 0) { res.status(400).json({ error: 'passIds required' }); return; }
+  const deleteFiles = Boolean(req.body?.deleteFiles);
+  const deleted: number[] = [];
+  const errors: { passId: number; error: string }[] = [];
+  for (const passId of passIds) {
+    try {
+      await deletePass(passId, { deleteFiles });
+      deleted.push(passId);
+    } catch (err) {
+      errors.push({ passId, error: String(err) });
+    }
+  }
+  schemaCache = null;
+  res.status(errors.length && !deleted.length ? 500 : 200).json({ deleted, errors });
+});
+
+router.post('/management/clear-database', async (req, res) => {
+  if (!requireManagementPassword(req.body, res)) return;
+  try {
+    const count = await clearAllData({ deleteFiles: Boolean(req.body?.deleteFiles) });
+    schemaCache = null;
+    res.json({ ok: true, deletedPasses: count });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

@@ -1559,6 +1559,27 @@ export async function deletePass(passId: number, options: { deleteFiles?: boolea
   }
 }
 
+export async function getAllPassIds(): Promise<number[]> {
+  const res = await pool.query('SELECT pass_id FROM passes ORDER BY pass_id');
+  return (res.rows as { pass_id: number }[]).map(r => r.pass_id);
+}
+
+// Delete every pass and all derived data, returning the number of passes
+// removed. Also clears the cross-pass reassembly store so no orphaned chunks
+// or merged-file records survive a full wipe.
+export async function clearAllData(options: { deleteFiles?: boolean } = {}): Promise<number> {
+  const ids = await getAllPassIds();
+  for (const id of ids) {
+    await deletePass(id, options);
+  }
+  await pool.query('DELETE FROM merged_files');
+  await pool.query('DELETE FROM file_chunks');
+  if (options.deleteFiles) {
+    rmSync(join(FILES_DIR, MERGED_TABLE_ID), { recursive: true, force: true });
+  }
+  return ids.length;
+}
+
 // ── File assembly ─────────────────────────────────────────────────────────────
 
 export const FILES_DIR         = resolve(process.cwd(), 'assembled_files');

@@ -75,6 +75,12 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
   const [backupPhase, setBackupPhase] = useState<Phase>('idle');
   const [backupError, setBackupError] = useState('');
 
+  const [deleteFiles, setDeleteFiles] = useState(true);
+  const [deletingPassId, setDeletingPassId] = useState<number | null>(null);
+  const [deleteError, setDeleteError] = useState('');
+  const [clearPhase, setClearPhase] = useState<Phase>('idle');
+  const [clearError, setClearError] = useState('');
+
   const unlock = async () => {
     setUnlockError('');
     try {
@@ -180,6 +186,57 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
     } catch (err) {
       setBackupError(String(err));
       setBackupPhase('error');
+    }
+  };
+
+  const deletePass = async (passId: number) => {
+    if (!window.confirm(`Delete pass_${passId} and all its derived data${deleteFiles ? ', including stored files' : ''}? This cannot be undone.`)) return;
+    setDeletingPassId(passId);
+    setDeleteError('');
+    try {
+      const res = await fetch('/api/management/passes/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password, passIds: [passId], deleteFiles }),
+      });
+      const data = await res.json() as { deleted?: number[]; errors?: { passId: number; error: string }[]; error?: string };
+      if (!res.ok || (data.errors && data.errors.length > 0)) {
+        setDeleteError(data.error ?? data.errors?.[0]?.error ?? 'Delete failed');
+        return;
+      }
+      onSchemaRefresh?.();
+      onDataRefresh?.();
+    } catch (err) {
+      setDeleteError(String(err));
+    } finally {
+      setDeletingPassId(null);
+    }
+  };
+
+  const clearDatabase = async () => {
+    if (passIds.length === 0) return;
+    if (!window.confirm(`Delete ALL ${passIds.length} pass${passIds.length !== 1 ? 'es' : ''} and every derived table${deleteFiles ? ', including stored files' : ''}? This wipes the database and cannot be undone.`)) return;
+    if (!window.confirm('Are you absolutely sure? This is irreversible.')) return;
+    setClearPhase('running');
+    setClearError('');
+    try {
+      const res = await fetch('/api/management/clear-database', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password, deleteFiles }),
+      });
+      const data = await res.json() as { ok?: boolean; deletedPasses?: number; error?: string };
+      if (!res.ok || !data.ok) {
+        setClearError(data.error ?? 'Clear failed');
+        setClearPhase('error');
+        return;
+      }
+      setClearPhase('done');
+      onSchemaRefresh?.();
+      onDataRefresh?.();
+    } catch (err) {
+      setClearError(String(err));
+      setClearPhase('error');
     }
   };
 
@@ -307,6 +364,67 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
                 <div style={{ fontSize: 10.5, ...mono, color: C.success }}>Backup downloaded.</div>
               )}
               {backupPhase === 'error' && <div style={{ fontSize: 10.5, ...mono, color: C.danger }}>{backupError}</div>}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ backgroundColor: C.bgPanel, border: `1px solid ${C.danger}44`, borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.borderSubtle}`, fontSize: 10.5, ...mono, color: C.danger, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Danger zone
+          </div>
+          <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, ...mono, color: C.textMuted, cursor: 'pointer' }}>
+              <input type="checkbox" checked={deleteFiles} onChange={(e) => setDeleteFiles(e.target.checked)} />
+              Also delete stored files (`assembled_files/` and `ingested_jsonl/`) for removed passes
+            </label>
+
+            <div>
+              <div style={{ fontSize: 12, ...mono, color: C.textPrimary, marginBottom: 4 }}>Delete individual passes</div>
+              <div style={{ fontSize: 11, ...mono, color: C.textMuted, lineHeight: 1.5, marginBottom: 8 }}>
+                Removes the pass event table plus its `decoded_telemetry`, `satellite_values`, `pass_files` and cross-pass chunks.
+              </div>
+              {passIds.length === 0 ? (
+                <div style={{ fontSize: 10.5, ...mono, color: C.textDisabled }}>No passes in database.</div>
+              ) : (
+                <div style={{
+                  maxHeight: 200, overflow: 'auto',
+                  backgroundColor: C.bgApp, border: `1px solid ${C.borderSubtle}`, borderRadius: 3,
+                }}>
+                  {passIds.map((id) => (
+                    <div key={id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '6px 10px', borderBottom: `1px solid ${C.borderSubtle}` }}>
+                      <span style={{ fontSize: 11, ...mono, color: C.textPrimary }}>pass_{id}</span>
+                      <button
+                        onClick={() => void deletePass(id)}
+                        disabled={deletingPassId !== null || clearPhase === 'running'}
+                        style={btnStyle('danger', deletingPassId !== null || clearPhase === 'running')}
+                      >
+                        {deletingPassId === id ? 'Deleting...' : 'Delete'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {deleteError && <div style={{ fontSize: 10.5, ...mono, color: C.danger, marginTop: 8 }}>{deleteError}</div>}
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto', gap: 14, alignItems: 'start', borderTop: `1px solid ${C.borderSubtle}`, paddingTop: 14 }}>
+              <div>
+                <div style={{ fontSize: 12, ...mono, color: C.textPrimary, marginBottom: 4 }}>Clear entire database</div>
+                <div style={{ fontSize: 11, ...mono, color: C.textMuted, lineHeight: 1.5 }}>
+                  Deletes every pass and all derived tables, plus the cross-pass reassembly store. Irreversible. Take a backup first.
+                </div>
+              </div>
+              <button
+                onClick={() => void clearDatabase()}
+                disabled={passIds.length === 0 || clearPhase === 'running' || deletingPassId !== null}
+                style={btnStyle('danger', passIds.length === 0 || clearPhase === 'running' || deletingPassId !== null)}
+              >
+                {clearPhase === 'running' ? 'Clearing...' : 'Clear Database'}
+              </button>
+              <div style={{ gridColumn: '1 / -1' }}>
+                {clearPhase === 'done' && <div style={{ fontSize: 10.5, ...mono, color: C.success }}>Database cleared.</div>}
+                {clearPhase === 'error' && <div style={{ fontSize: 10.5, ...mono, color: C.danger }}>{clearError}</div>}
+              </div>
             </div>
           </div>
         </div>
