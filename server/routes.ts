@@ -18,11 +18,13 @@ import {
   listPassFiles,
   type ValuesFilter,
 } from './db.js';
+import { requestUpdate, getDeployStatus, reportDeploy } from './deployState.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
 export const router = Router();
 const MANAGEMENT_PASSWORD = process.env.MAVERIC_MANAGEMENT_PASSWORD ?? 'maveric';
+const DEPLOY_TOKEN = process.env.MAVERIC_DEPLOY_TOKEN ?? MANAGEMENT_PASSWORD;
 
 // Cache schema in memory — it's static for this dataset
 let schemaCache: Awaited<ReturnType<typeof loadSchema>> | null = null;
@@ -304,6 +306,49 @@ router.post('/management/clear-database', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
+});
+
+// ─── Software update / deploy coordination ───────────────────────────────────
+// The button posts here to request a pull + rebuild + restart. The keep-alive
+// supervisors on the data and web hosts poll GET /api/deploy/status, apply the
+// update, and report progress back with POST /api/deploy/report.
+
+function requireDeployToken(req: { body?: unknown; headers: Record<string, unknown> }, res: Response): boolean {
+  const header = req.headers['x-deploy-token'];
+  const token = typeof header === 'string' ? header : (req.body as { token?: string } | undefined)?.token;
+  if (token === DEPLOY_TOKEN) return true;
+  // Management password is also accepted so an operator can drive it manually.
+  const password = (req.body as { password?: string } | undefined)?.password;
+  if (password === MANAGEMENT_PASSWORD) return true;
+  res.status(403).json({ error: 'Invalid deploy token' });
+  return false;
+}
+
+router.post('/management/update', (req, res) => {
+  if (!requireManagementPassword(req.body, res)) return;
+  const branch = typeof req.body?.branch === 'string' && req.body.branch.trim()
+    ? req.body.branch.trim()
+    : undefined;
+  res.json(requestUpdate('management', branch));
+});
+
+router.get('/deploy/status', (_req, res) => {
+  res.json(getDeployStatus());
+});
+
+router.post('/deploy/report', (req, res) => {
+  if (!requireDeployToken(req, res)) return;
+  const role = req.body?.role;
+  if (role !== 'data' && role !== 'web') {
+    res.status(400).json({ error: 'role must be "data" or "web"' });
+    return;
+  }
+  res.json(reportDeploy(role, {
+    generation: Number(req.body?.generation) || undefined,
+    sha: typeof req.body?.sha === 'string' ? req.body.sha : undefined,
+    status: req.body?.status,
+    message: typeof req.body?.message === 'string' ? req.body.message : undefined,
+  }));
 });
 
 router.get('/history/summary', async (req, res) => {

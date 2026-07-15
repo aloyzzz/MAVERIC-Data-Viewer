@@ -1,2 +1,4 @@
 node_modules/
 dist/
+deploy-state.json
+deploy-state.json.tmp

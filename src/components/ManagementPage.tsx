@@ -1,8 +1,23 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { C } from '../lib/colors';
 import type { AppSchema } from '../types';
 
 type Phase = 'idle' | 'running' | 'done' | 'error';
+
+type DeployRole = 'data' | 'web';
+
+interface AppliedState {
+  generation: number;
+  sha: string;
+  status: 'idle' | 'deploying' | 'ok' | 'error';
+  message: string;
+  at: string;
+}
+
+interface DeployStatus {
+  requested: { generation: number; branch: string; at: string; by: string };
+  applied: Record<DeployRole, AppliedState | null>;
+}
 
 interface ManagementPageProps {
   schema: AppSchema;
@@ -80,6 +95,50 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
   const [deleteError, setDeleteError] = useState('');
   const [clearPhase, setClearPhase] = useState<Phase>('idle');
   const [clearError, setClearError] = useState('');
+
+  const [updatePhase, setUpdatePhase] = useState<Phase>('idle');
+  const [updateError, setUpdateError] = useState('');
+  const [deployStatus, setDeployStatus] = useState<DeployStatus | null>(null);
+
+  const refreshDeployStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/deploy/status');
+      if (res.ok) setDeployStatus(await res.json() as DeployStatus);
+    } catch { /* non-fatal */ }
+  }, []);
+
+  // Poll deploy status while unlocked so the per-host progress stays live.
+  useEffect(() => {
+    if (!unlocked) return;
+    void refreshDeployStatus();
+    const id = setInterval(() => { void refreshDeployStatus(); }, 5000);
+    return () => clearInterval(id);
+  }, [unlocked, refreshDeployStatus]);
+
+  const triggerUpdate = async () => {
+    if (!window.confirm('Pull the latest release, rebuild, and restart the data and web servers? Active sessions will briefly disconnect while each host restarts.')) return;
+    setUpdatePhase('running');
+    setUpdateError('');
+    try {
+      const res = await fetch('/api/management/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json() as DeployStatus | { error?: string };
+      if (!res.ok || !('requested' in data)) {
+        setUpdateError('error' in data && data.error ? data.error : 'Update request failed');
+        setUpdatePhase('error');
+        return;
+      }
+      setDeployStatus(data);
+      setUpdatePhase('done');
+      void refreshDeployStatus();
+    } catch (err) {
+      setUpdateError(String(err));
+      setUpdatePhase('error');
+    }
+  };
 
   const unlock = async () => {
     setUnlockError('');
@@ -341,6 +400,66 @@ export function ManagementPage({ schema, onSchemaRefresh, onDataRefresh }: Manag
               )}
               {valuesPhase === 'error' && <div style={{ fontSize: 10.5, ...mono, color: C.danger, marginBottom: 8 }}>{valuesError}</div>}
               <ResultList results={valuesResults} />
+            </div>
+          </div>
+        </div>
+
+        <div style={{ backgroundColor: C.bgPanel, border: `1px solid ${C.borderSubtle}`, borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.borderSubtle}`, fontSize: 10.5, ...mono, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            Software updates
+          </div>
+          <div style={{ padding: 14, display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) auto', gap: 14, alignItems: 'start' }}>
+            <div>
+              <div style={{ fontSize: 12, ...mono, color: C.textPrimary, marginBottom: 4 }}>Update &amp; restart servers</div>
+              <div style={{ fontSize: 11, ...mono, color: C.textMuted, lineHeight: 1.5 }}>
+                Requests the keep-alive supervisors on the data and web hosts to pull the latest
+                {deployStatus?.requested.branch ? ` \`${deployStatus.requested.branch}\`` : ' release'} branch,
+                rebuild, and restart. Each host applies the update on its next poll.
+              </div>
+            </div>
+            <button onClick={() => void triggerUpdate()} disabled={updatePhase === 'running'} style={btnStyle('danger', updatePhase === 'running')}>
+              {updatePhase === 'running' ? 'Requesting...' : 'Update & Restart'}
+            </button>
+            <div style={{ gridColumn: '1 / -1' }}>
+              {updatePhase === 'done' && (
+                <div style={{ fontSize: 10.5, ...mono, color: C.success, marginBottom: 8 }}>
+                  Update requested (generation {deployStatus?.requested.generation}). Supervisors will apply it shortly.
+                </div>
+              )}
+              {updatePhase === 'error' && <div style={{ fontSize: 10.5, ...mono, color: C.danger, marginBottom: 8 }}>{updateError}</div>}
+              {deployStatus && (
+                <div style={{
+                  backgroundColor: C.bgApp, border: `1px solid ${C.borderSubtle}`,
+                  borderRadius: 3, padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6,
+                }}>
+                  <div style={{ fontSize: 10, ...mono, color: C.textDisabled }}>
+                    requested generation {deployStatus.requested.generation}
+                    {deployStatus.requested.at ? ` · ${new Date(deployStatus.requested.at).toLocaleString()}` : ''}
+                  </div>
+                  {(['data', 'web'] as DeployRole[]).map((role) => {
+                    const a = deployStatus.applied[role];
+                    const behind = a ? a.generation < deployStatus.requested.generation : true;
+                    const color =
+                      !a ? C.textDisabled
+                      : a.status === 'error' ? C.danger
+                      : a.status === 'deploying' ? C.warning
+                      : behind ? C.warning
+                      : C.success;
+                    const label =
+                      !a ? 'no report yet'
+                      : a.status === 'deploying' ? 'deploying...'
+                      : a.status === 'error' ? `error: ${a.message}`
+                      : behind ? `behind (gen ${a.generation})`
+                      : `up to date (gen ${a.generation}${a.sha ? `, ${a.sha}` : ''})`;
+                    return (
+                      <div key={role} style={{ fontSize: 10.5, ...mono, color, display: 'flex', gap: 8 }}>
+                        <span style={{ width: 42, color: C.textMuted }}>{role}</span>
+                        <span>{label}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
         </div>
