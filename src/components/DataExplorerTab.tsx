@@ -7,8 +7,9 @@ import { useTableRows } from '../hooks/useApi';
 import { msToInput, inputToMs, useTz } from '../lib/timezone';
 import { DataTable } from './DataTable';
 import { DetailPane } from './DetailPane';
+import { FilesTab } from './DecodedFramesTab';
 
-type ExplorerMode = 'decoded' | 'raw';
+type ExplorerMode = 'decoded' | 'raw' | 'files';
 type ExportFormat = 'long' | 'wide';
 type DatePreset = 'all' | '24h' | '7d' | '30d' | 'custom';
 
@@ -219,7 +220,14 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
     .map(Number)
     .sort((a, b) => a - b), [schema]);
   const visibleRawTables = useMemo(() => allTables.filter(t => !isPassTable(t.id)), [allTables]);
+  const passTables = useMemo(
+    () => allTables
+      .filter(t => isPassTable(t.id))
+      .sort((a, b) => Number(/^pass_(\d+)$/.exec(a.id)?.[1]) - Number(/^pass_(\d+)$/.exec(b.id)?.[1])),
+    [allTables],
+  );
   const [mode, setMode] = useState<ExplorerMode>('decoded');
+  const [filesPassId, setFilesPassId] = useState(() => passTables[0]?.id ?? '');
   const [rawTableId, setRawTableId] = useState(() => pickDefaultRawTable(schema));
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<SortState>({ col: 'ts_ms', dir: 'desc' });
@@ -295,6 +303,12 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
   useEffect(() => {
     setSelected(null);
   }, [mode, rawTableId]);
+
+  // Keep the files pass selection valid as the schema loads or changes.
+  useEffect(() => {
+    if (passTables.length === 0) return;
+    if (!passTables.some(t => t.id === filesPassId)) setFilesPassId(passTables[0].id);
+  }, [passTables, filesPassId]);
 
   useEffect(() => {
     if (mode !== 'decoded') return;
@@ -428,6 +442,7 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
           </span>
           <ToolbarButton active={mode === 'decoded'} onClick={() => setMode('decoded')}>decoded values</ToolbarButton>
           <ToolbarButton active={mode === 'raw'} onClick={() => setMode('raw')}>raw tables</ToolbarButton>
+          <ToolbarButton active={mode === 'files'} onClick={() => setMode('files')}>files</ToolbarButton>
           {mode === 'raw' && (
             <select
               value={rawTableId}
@@ -443,6 +458,18 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
               ))}
             </select>
           )}
+          {mode === 'files' && (
+            <select
+              value={filesPassId}
+              onChange={e => setFilesPassId(e.target.value)}
+              style={{ ...inputStyle, minWidth: 220 }}
+            >
+              {passTables.length === 0 && <option value="">no passes</option>}
+              {passTables.map(t => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
+          )}
           <div style={{ flex: 1 }} />
           {mode === 'decoded' && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -451,6 +478,7 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
               ))}
             </div>
           )}
+          {mode !== 'files' && (
           <button
             onClick={exportCurrent}
             disabled={loading || sortedRows.length === 0}
@@ -468,8 +496,10 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
           >
             export CSV
           </button>
+          )}
         </div>
 
+        {mode !== 'files' && (
         <div style={{
           display: 'flex',
           alignItems: 'center',
@@ -517,7 +547,11 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
             {mode === 'decoded' && <Stat label="params" value={(decodedSummary?.parameters ?? 0).toLocaleString()} />}
           </div>
         </div>
+        )}
 
+        {mode === 'files' ? (
+          <FilesTab tableId={filesPassId} />
+        ) : (
         <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
           {showRail && (
             <div style={{
@@ -703,6 +737,7 @@ export function DataExplorerTab({ schema, onSchemaRefresh }: { schema: AppSchema
             position="right"
           />
         </div>
+        )}
       </div>
     </div>
   );
